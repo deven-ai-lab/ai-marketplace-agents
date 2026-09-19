@@ -7,3 +7,6 @@ supabase==2.3.5
 pydantic==2.4.2
 sqlalchemy==2.0.23
 psycopg2-binary==2.9.9
+pydantic-settings==2.1.0
+httpx==0.25.2
+alembic==1.13.0
