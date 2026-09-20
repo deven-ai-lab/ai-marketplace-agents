@@ -195,12 +195,12 @@ Format:
   {
     "brand_id": "NIKE-001",
     "brand_name": "Nike India",
-    "pitch_email": "Subject: Creator Partnership Opportunity - Nike India\n\nDear Nike Team,..."
+    "pitch_email": "Subject: Creator Partnership Opportunity - Nike India\\n\\nDear Nike Team,..."
   },
   {
     "brand_id": "ADIDAS-001",
     "brand_name": "Adidas India",
-    "pitch_email": "Subject: Creator Partnership Opportunity - Adidas India\n\nDear Adidas Team,..."
+    "pitch_email": "Subject: Creator Partnership Opportunity - Adidas India\\n\\nDear Adidas Team,..."
   }
 ]
 """
@@ -221,23 +221,22 @@ For each brand, create a personalized pitch email. Return ONLY the JSON array, n
             ]
         )
 
-# Extract and parse response
-response_text = response.content[0].text
-
-if not response_text:
-    raise Exception("Empty response from Claude")
-
-# Clean response (remove markdown code blocks if present)
-if response_text.startswith("```json"):
-    response_text = response_text[7:]
-elif response_text.startswith("```"):
-    response_text = response_text[3:]
-
-if response_text.endswith("```"):
-    response_text = response_text[:-3]
-
-response_text = response_text.strip()
-pitches = json.loads(response_text)
+        # Extract and parse response
+        if not response.content or not response.content[0].text:
+            raise Exception("Empty response from Claude")
+        
+        response_text = response.content[0].text.strip()
+        
+        # Clean response (remove markdown code blocks if present)
+        if response_text.startswith("```json"):
+            response_text = response_text[7:]
+        if response_text.startswith("```"):
+            response_text = response_text[3:]
+        if response_text.endswith("```"):
+            response_text = response_text[:-3]
+        
+        response_text = response_text.strip()
+        pitches = json.loads(response_text)
 
         # Format response with metadata
         db = SessionLocal()
@@ -325,7 +324,10 @@ Provide strategic recommendations."""
             ]
         )
 
-        response_text = response.content[0].text
+        if not response.content or not response.content[0].text:
+            raise Exception("Empty response from Claude")
+        
+        response_text = response.content[0].text.strip()
         
         # Clean response
         if response_text.startswith("```json"):
