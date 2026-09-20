@@ -362,6 +362,58 @@ async def revenue_analytics(db: Session = Depends(get_db)):
         "barter_campaigns_completed": len(barter_campaigns)
     }
 
+# ========== STEVE - BRAND MANAGER AGENT ==========
+
+import anthropic
+import json
+import os
+
+class SteveRequest(BaseModel):
+    brand_id: str
+    brand_name: str
+    budget: int
+    timeline_days: int
+    niche: str
+    requirements: str
+    target_audience: Optional[str] = None
+
+@app.post("/agent/steve")
+async def steve_agent(request: SteveRequest):
+    """Steve - Brand Manager Agent"""
+    try:
+        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        
+        system_prompt = """You are Steve, Brand Manager Agent. Analyze brand briefs and return ONLY JSON with:
+- feasibility_score (1-10)
+- strategy (brief summary)
+- recommended_creators_count
+- email_template
+- next_steps (list)
+- flags_for_deven (list)"""
+
+        user_message = f"""Brand: {request.brand_name}
+Budget: ₹{request.budget:,}
+Timeline: {request.timeline_days} days
+Niche: {request.niche}
+Requirements: {request.requirements}
+Target: {request.target_audience or 'Not specified'}
+
+Return ONLY JSON."""
+
+        message = client.messages.create(
+            model="claude-opus-5",
+            max_tokens=1000,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_message}]
+        )
+
+        response_text = message.content[0].text
+        strategy = json.loads(response_text)
+        
+        return {"status": "success", "brand_id": request.brand_id, "strategy": strategy}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host=HOST, port=PORT)
