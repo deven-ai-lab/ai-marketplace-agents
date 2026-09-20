@@ -221,19 +221,23 @@ For each brand, create a personalized pitch email. Return ONLY the JSON array, n
             ]
         )
 
-        # Extract and parse response
-        response_text = response.content[0].text
-        
-        # Clean response (remove markdown code blocks if present)
-        if response_text.startswith("```json"):
-            response_text = response_text[7:]
-        if response_text.startswith("```"):
-            response_text = response_text[3:]
-        if response_text.endswith("```"):
-            response_text = response_text[:-3]
-        
-        response_text = response_text.strip()
-        pitches = json.loads(response_text)
+# Extract and parse response
+response_text = response.content[0].text
+
+if not response_text:
+    raise Exception("Empty response from Claude")
+
+# Clean response (remove markdown code blocks if present)
+if response_text.startswith("```json"):
+    response_text = response_text[7:]
+elif response_text.startswith("```"):
+    response_text = response_text[3:]
+
+if response_text.endswith("```"):
+    response_text = response_text[:-3]
+
+response_text = response_text.strip()
+pitches = json.loads(response_text)
 
         # Format response with metadata
         db = SessionLocal()
