@@ -2,22 +2,29 @@ import os
 import uuid
 import json
 from datetime import datetime
-from typing import List, Optional
-
-from fastapi import FastAPI, Depends, HTTPException, Query
-from fastapi.responses import JSONResponse
+from typing import Optional, List
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_, text
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
-import anthropic
+from anthropic import Anthropic
 
-from config import engine, SessionLocal, get_db, HOST, PORT, DEBUG
-from models import Base, Brand, Creator, Campaign
+# Configuration
+DATABASE_URL = os.getenv("DATABASE_URL")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+PORT = int(os.getenv("PORT", 8000))
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
-app = FastAPI(title="AI-to-AI Marketplace API", version="1.0.0")
+# Initialize FastAPI app
+app = FastAPI(
+    title="AI Marketplace Agents",
+    description="Steve (Brand Manager), Fred (Matcher), Aditya (Creator Manager)",
+    version="1.0.0"
+)
 
-# Enable CORS
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,102 +33,92 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ========== PYDANTIC SCHEMAS ==========
+# Database setup
+engine = create_engine(DATABASE_URL, echo=DEBUG)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
-class BrandCreate(BaseModel):
-    name: str
-    industry: Optional[str] = None
-    email: Optional[str] = None
+# Database models
+class Brand(Base):
+    __tablename__ = "brands"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    brand_id = Column(String, unique=True, index=True)
+    brand_name = Column(String)
+    industry = Column(String)
+    email = Column(String)
+    phone = Column(String, nullable=True)
+    website = Column(String, nullable=True)
+    basic_info = Column(Text)
+    budget = Column(Integer, nullable=True)
+    platform = Column(String, nullable=True)
+    timeline_days = Column(Integer, nullable=True)
+    niche = Column(String, nullable=True)
+    requirements = Column(Text, nullable=True)
+    email_sent_date = Column(DateTime, nullable=True)
+    response_received = Column(String, default="false")
+    approval_status = Column(String, default="pending")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Creator(Base):
+    __tablename__ = "creators"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    creator_id = Column(String, unique=True, index=True)
+    name = Column(String)
+    platform = Column(String)
+    handle = Column(String)
+    followers = Column(Integer, nullable=True)
+    engagement_rate = Column(String, nullable=True)
+    niche = Column(String, nullable=True)
+    email = Column(String, nullable=True)
+    phone = Column(String, nullable=True)
+    restrictions = Column(Text, nullable=True)
+    min_budget = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Match(Base):
+    __tablename__ = "matches"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    brand_id = Column(String)
+    creator_id = Column(String)
+    creator_name = Column(String)
+    match_score = Column(Integer)
+    niche_match = Column(String)
+    audience_match = Column(String)
+    budget_fit = Column(String)
+    platform_match = Column(String)
+    engagement_metric = Column(String)
+    key_strengths = Column(Text)
+    concerns = Column(Text)
+    overall_reasoning = Column(Text)
+    approval_status = Column(String, default="pending")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# Create tables
+Base.metadata.create_all(bind=engine)
+
+# Pydantic models
+class PitchBrandInput(BaseModel):
+    brand_id: str
+    brand_name: str
+    industry: str
+    email: str
     phone: Optional[str] = None
-    location: Optional[str] = None
-    budget: Optional[float] = None
-    target_audience_age: Optional[str] = None
-    target_audience_interests: Optional[str] = None
-    target_audience_gender: Optional[str] = None
-    platforms_needed: Optional[List[str]] = None
-    content_format_wanted: Optional[List[str]] = None
-    content_type: Optional[List[str]] = None
-    location_geography_focus: Optional[str] = None
-    timeline: Optional[str] = None
-    brand_brief: Optional[str] = None
-    past_campaigns_links: Optional[List[str]] = None
-    deven_notes: Optional[str] = None
+    website: Optional[str] = None
+    basic_info: str
 
-class BrandResponse(BrandCreate):
-    id: uuid.UUID
+class BatchPitchRequest(BaseModel):
+    action: str
+    brands: List[PitchBrandInput]
+
+class BrandResponse(BaseModel):
+    brand_id: str
+    brand_name: str
+    email: str
+    pitch_email: str
+    email_sent_date: str
     status: str
-    stage: str
-    matched_creators: Optional[List[uuid.UUID]] = None
-    created_at: datetime
-    updated_at: datetime
 
-    class Config:
-        from_attributes = True
-
-class CreatorCreate(BaseModel):
-    name: str
-    email: Optional[str] = None
-    phone: Optional[str] = None
-    instagram_handle: Optional[str] = None
-    youtube_channel: Optional[str] = None
-    tiktok_handle: Optional[str] = None
-    other_platforms: Optional[dict] = None
-    follower_count_instagram: Optional[float] = None
-    follower_count_youtube: Optional[float] = None
-    follower_count_tiktok: Optional[float] = None
-    engagement_rate: Optional[float] = None
-    niche: Optional[str] = None
-    content_specialties: Optional[List[str]] = None
-    audience_age: Optional[str] = None
-    audience_gender: Optional[str] = None
-    location: Optional[str] = None
-    rates_per_post: Optional[float] = None
-    rates_per_story: Optional[float] = None
-    rates_per_reel: Optional[float] = None
-    rates_longform_video: Optional[float] = None
-    barter_willing: Optional[bool] = False
-    past_brand_collaborations: Optional[List[str]] = None
-    bio: Optional[str] = None
-    profile_picture_url: Optional[str] = None
-    deven_notes: Optional[str] = None
-
-class CreatorResponse(CreatorCreate):
-    id: uuid.UUID
-    availability_status: str
-    created_at: datetime
-    updated_at: datetime
-
-    class Config:
-        from_attributes = True
-
-class CampaignCreate(BaseModel):
-    brand_id: uuid.UUID
-    creator_id: uuid.UUID
-    campaign_name: Optional[str] = None
-    collab_type: str
-    campaign_value: Optional[float] = None
-    commission_percentage: Optional[float] = None
-    flat_fee_amount: Optional[float] = None
-    deliverables: Optional[List[str]] = None
-    content_requirements: Optional[str] = None
-    timeline_start: Optional[str] = None
-    timeline_end: Optional[str] = None
-    notes: Optional[str] = None
-
-class CampaignResponse(CampaignCreate):
-    id: uuid.UUID
-    commission_amount: Optional[float] = None
-    status: str
-    payment_status: str
-    amount_paid: float
-    content_submission_status: str
-    created_at: datetime
-    updated_at: datetime
-
-    class Config:
-        from_attributes = True
-
-class SteveRequest(BaseModel):
+class CampaignAnalysisRequest(BaseModel):
     brand_id: str
     brand_name: str
     budget: int
@@ -130,270 +127,313 @@ class SteveRequest(BaseModel):
     requirements: str
     target_audience: Optional[str] = None
 
-# ========== HEALTH CHECK ==========
+# Initialize Anthropic client
+client = Anthropic()
 
+# ============ HEALTH CHECK ============
 @app.get("/health")
-async def health_check():
+async def health_check(db: Session = None):
+    """Health check endpoint"""
     try:
-        db = SessionLocal()
-        db.execute(text("SELECT 1"))
-        db.close()
-        return {"status": "healthy", "database": "connected"}
+        if DATABASE_URL:
+            db = SessionLocal()
+            db.execute("SELECT 1")
+            db.close()
+            return {"status": "healthy", "database": "connected"}
     except Exception as e:
-        return {"status": "degraded", "database": "disconnected", "error": str(e)}
+        return {"status": "unhealthy", "database": "disconnected", "error": str(e)}
+    return {"status": "healthy"}
 
-# ========== STEVE - BRAND MANAGER AGENT ==========
+# ============ STEVE: BRAND MANAGER AGENT ============
+
+@app.post("/agent/steve/generate-pitches-batch")
+async def generate_pitches_batch(request: BatchPitchRequest):
+    """
+    STEVE: Batch generate pitch emails for multiple brands
+    Input: Array of brands with basic info
+    Output: Array of pitch emails ready to send
+    """
+    try:
+        if request.action != "send_pitch_emails_batch":
+            raise HTTPException(status_code=400, detail="Invalid action")
+
+        # Prepare brands data for Claude
+        brands_text = "\n\n".join([
+            f"""Brand #{i+1}:
+- ID: {brand.brand_id}
+- Name: {brand.brand_name}
+- Industry: {brand.industry}
+- Email: {brand.email}
+- Basic Info: {brand.basic_info}"""
+            for i, brand in enumerate(request.brands)
+        ])
+
+        # System prompt for batch pitch generation
+        system_prompt = """You are Steve, the Brand Manager Agent for an AI-powered influencer marketing agency.
+
+Your role: Generate compelling pitch emails to brands interested in creator partnerships.
+
+You have access to 200+ micro and macro influencers across various niches (sports, fitness, beauty, tech, lifestyle, gaming, etc).
+
+For each brand provided, generate a professional pitch email that:
+1. Opens with the brand's context
+2. Explains what you do (connect brands with influencers)
+3. Highlights relevant creators in their niche
+4. Asks for their campaign details (budget, platform, timeline)
+5. Calls them to action
+
+Email must be:
+- Professional but friendly
+- Concise (under 200 words)
+- Personalized to their industry
+- Include a clear call-to-action
+
+IMPORTANT: Return ONLY valid JSON array. No preamble, no explanation.
+
+Format:
+[
+  {
+    "brand_id": "NIKE-001",
+    "brand_name": "Nike India",
+    "pitch_email": "Subject: Creator Partnership Opportunity - Nike India\n\nDear Nike Team,..."
+  },
+  {
+    "brand_id": "ADIDAS-001",
+    "brand_name": "Adidas India",
+    "pitch_email": "Subject: Creator Partnership Opportunity - Adidas India\n\nDear Adidas Team,..."
+  }
+]
+"""
+
+        user_message = f"""Generate pitch emails for these brands:
+
+{brands_text}
+
+For each brand, create a personalized pitch email. Return ONLY the JSON array, no other text."""
+
+        # Call Claude API
+        response = client.messages.create(
+            model="claude-opus-4-20250805",
+            max_tokens=4000,
+            system=system_prompt,
+            messages=[
+                {"role": "user", "content": user_message}
+            ]
+        )
+
+        # Extract and parse response
+        response_text = response.content[0].text
+        
+        # Clean response (remove markdown code blocks if present)
+        if response_text.startswith("```json"):
+            response_text = response_text[7:]
+        if response_text.startswith("```"):
+            response_text = response_text[3:]
+        if response_text.endswith("```"):
+            response_text = response_text[:-3]
+        
+        response_text = response_text.strip()
+        pitches = json.loads(response_text)
+
+        # Format response with metadata
+        db = SessionLocal()
+        results = []
+        email_sent_date = datetime.utcnow().isoformat()
+
+        for pitch in pitches:
+            result = {
+                "brand_id": pitch.get("brand_id"),
+                "brand_name": pitch.get("brand_name"),
+                "email": next((b.email for b in request.brands if b.brand_id == pitch.get("brand_id")), ""),
+                "pitch_email": pitch.get("pitch_email"),
+                "email_sent_date": email_sent_date,
+                "status": "pitch_generated"
+            }
+            results.append(BrandResponse(**result))
+
+        db.close()
+
+        return {
+            "status": "success",
+            "action": "send_pitch_emails_batch",
+            "total_brands": len(request.brands),
+            "pitches": [r.dict() for r in results]
+        }
+
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to parse Claude response: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating pitches: {str(e)}")
+
 
 @app.post("/agent/steve")
-async def steve_agent(request: SteveRequest):
-    """Steve - Brand Manager Agent"""
+async def steve_campaign_analysis(request: CampaignAnalysisRequest):
+    """
+    STEVE: Brand Manager Agent - Analyze campaign briefs
+    Input: Complete brand campaign details
+    Output: Strategy, feasibility, email template, next steps
+    """
     try:
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            return {"status": "error", "detail": "ANTHROPIC_API_KEY not set"}
-        
-        client = anthropic.Anthropic(api_key=api_key)
-        
-        system_prompt = """You are Steve, Brand Manager Agent. Analyze brand briefs and return ONLY a JSON object with these fields:
+        system_prompt = """You are Steve, the Brand Manager Agent for an AI influencer marketing agency.
+
+Your role: Analyze brand campaign briefs and provide strategic recommendations.
+
+You manage relationships with 200+ creators across multiple niches and platforms.
+
+For each brand brief, provide:
+1. Feasibility Score (1-10)
+2. Detailed Strategy
+3. Recommended Creator Count
+4. Draft Email Template
+5. Next Steps
+6. Flags for Manual Review
+
+Return ONLY valid JSON. No other text.
+
+Format:
 {
-  "feasibility_score": (1-10),
-  "strategy": "brief strategy description",
-  "recommended_creators_count": (number),
-  "email_template": "draft email to send",
-  "next_steps": ["step1", "step2"],
-  "flags_for_deven": ["flag1", "flag2"]
+  "feasibility_score": 7,
+  "strategy": "Recommended approach...",
+  "recommended_creators_count": 5,
+  "email_template": "Draft email to send to creator...",
+  "next_steps": ["Step 1", "Step 2"],
+  "flags_for_deven": ["Flag 1", "Flag 2"]
 }
+"""
 
-No other text, just JSON."""
-
-        user_message = f"""Analyze this brand brief:
+        user_message = f"""Analyze this brand campaign brief:
 
 Brand: {request.brand_name}
-Budget: ₹{request.budget:,}
+Budget: ₹{request.budget}
 Timeline: {request.timeline_days} days
 Niche: {request.niche}
 Requirements: {request.requirements}
 Target Audience: {request.target_audience or 'Not specified'}
 
-Return ONLY JSON object."""
+Provide strategic recommendations."""
 
-        message = client.messages.create(
-            model="claude-opus-5",
-            max_tokens=1500,
+        response = client.messages.create(
+            model="claude-opus-4-20250805",
+            max_tokens=2000,
             system=system_prompt,
-            messages=[{"role": "user", "content": user_message}]
+            messages=[
+                {"role": "user", "content": user_message}
+            ]
         )
 
-        response_text = message.content[0].text
+        response_text = response.content[0].text
         
-        try:
-            strategy = json.loads(response_text)
-        except json.JSONDecodeError:
-            strategy = {"raw_response": response_text}
+        # Clean response
+        if response_text.startswith("```json"):
+            response_text = response_text[7:]
+        if response_text.startswith("```"):
+            response_text = response_text[3:]
+        if response_text.endswith("```"):
+            response_text = response_text[:-3]
         
+        response_text = response_text.strip()
+        strategy = json.loads(response_text)
+
         return {
             "status": "success",
             "brand_id": request.brand_id,
             "strategy": strategy
         }
+
     except Exception as e:
-        return {"status": "error", "detail": str(e)}
+        raise HTTPException(status_code=500, detail=f"Error analyzing campaign: {str(e)}")
 
-# ========== BRANDS ENDPOINTS ==========
 
-@app.post("/brands", response_model=BrandResponse)
-async def create_brand(brand: BrandCreate, db: Session = Depends(get_db)):
-    db_brand = Brand(**brand.dict())
-    db.add(db_brand)
-    db.commit()
-    db.refresh(db_brand)
-    return db_brand
+# ============ BRANDS CRUD ============
+@app.post("/brands")
+async def create_brand(brand: dict):
+    """Create a new brand"""
+    db = SessionLocal()
+    try:
+        db_brand = Brand(**brand, id=str(uuid.uuid4()))
+        db.add(db_brand)
+        db.commit()
+        db.refresh(db_brand)
+        return db_brand
+    finally:
+        db.close()
 
-@app.get("/brands", response_model=List[BrandResponse])
-async def get_brands(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(10, ge=1, le=100),
-    status: Optional[str] = None,
-    db: Session = Depends(get_db)
-):
-    query = db.query(Brand)
-    if status:
-        query = query.filter(Brand.status == status)
-    return query.offset(skip).limit(limit).all()
+@app.get("/brands")
+async def get_brands():
+    """Get all brands"""
+    db = SessionLocal()
+    try:
+        brands = db.query(Brand).all()
+        return brands
+    finally:
+        db.close()
 
-@app.get("/brands/{brand_id}", response_model=BrandResponse)
-async def get_brand(brand_id: uuid.UUID, db: Session = Depends(get_db)):
-    db_brand = db.query(Brand).filter(Brand.id == brand_id).first()
-    if not db_brand:
-        raise HTTPException(status_code=404, detail="Brand not found")
-    return db_brand
+@app.get("/brands/{brand_id}")
+async def get_brand(brand_id: str):
+    """Get specific brand"""
+    db = SessionLocal()
+    try:
+        brand = db.query(Brand).filter(Brand.brand_id == brand_id).first()
+        if not brand:
+            raise HTTPException(status_code=404, detail="Brand not found")
+        return brand
+    finally:
+        db.close()
 
-@app.put("/brands/{brand_id}", response_model=BrandResponse)
-async def update_brand(brand_id: uuid.UUID, brand: BrandCreate, db: Session = Depends(get_db)):
-    db_brand = db.query(Brand).filter(Brand.id == brand_id).first()
-    if not db_brand:
-        raise HTTPException(status_code=404, detail="Brand not found")
-    
-    for key, value in brand.dict(exclude_unset=True).items():
-        setattr(db_brand, key, value)
-    db_brand.updated_at = datetime.utcnow()
-    
-    db.commit()
-    db.refresh(db_brand)
-    return db_brand
+# ============ CREATORS CRUD ============
+@app.post("/creators")
+async def create_creator(creator: dict):
+    """Create a new creator"""
+    db = SessionLocal()
+    try:
+        db_creator = Creator(**creator, id=str(uuid.uuid4()))
+        db.add(db_creator)
+        db.commit()
+        db.refresh(db_creator)
+        return db_creator
+    finally:
+        db.close()
 
-@app.delete("/brands/{brand_id}")
-async def delete_brand(brand_id: uuid.UUID, db: Session = Depends(get_db)):
-    db_brand = db.query(Brand).filter(Brand.id == brand_id).first()
-    if not db_brand:
-        raise HTTPException(status_code=404, detail="Brand not found")
-    
-    db.delete(db_brand)
-    db.commit()
-    return {"message": "Brand deleted successfully"}
+@app.get("/creators")
+async def get_creators():
+    """Get all creators"""
+    db = SessionLocal()
+    try:
+        creators = db.query(Creator).all()
+        return creators
+    finally:
+        db.close()
 
-# ========== CREATORS ENDPOINTS ==========
+# ============ MATCHES CRUD ============
+@app.post("/matches")
+async def create_match(match: dict):
+    """Create a new match"""
+    db = SessionLocal()
+    try:
+        db_match = Match(**match, id=str(uuid.uuid4()))
+        db.add(db_match)
+        db.commit()
+        db.refresh(db_match)
+        return db_match
+    finally:
+        db.close()
 
-@app.post("/creators", response_model=CreatorResponse)
-async def create_creator(creator: CreatorCreate, db: Session = Depends(get_db)):
-    db_creator = Creator(**creator.dict())
-    db.add(db_creator)
-    db.commit()
-    db.refresh(db_creator)
-    return db_creator
+@app.get("/matches")
+async def get_matches():
+    """Get all matches"""
+    db = SessionLocal()
+    try:
+        matches = db.query(Match).all()
+        return matches
+    finally:
+        db.close()
 
-@app.get("/creators", response_model=List[CreatorResponse])
-async def get_creators(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(10, ge=1, le=100),
-    niche: Optional[str] = None,
-    availability: Optional[str] = None,
-    db: Session = Depends(get_db)
-):
-    query = db.query(Creator)
-    if niche:
-        query = query.filter(Creator.niche == niche)
-    if availability:
-        query = query.filter(Creator.availability_status == availability)
-    return query.offset(skip).limit(limit).all()
-
-@app.get("/creators/{creator_id}", response_model=CreatorResponse)
-async def get_creator(creator_id: uuid.UUID, db: Session = Depends(get_db)):
-    db_creator = db.query(Creator).filter(Creator.id == creator_id).first()
-    if not db_creator:
-        raise HTTPException(status_code=404, detail="Creator not found")
-    return db_creator
-
-@app.put("/creators/{creator_id}", response_model=CreatorResponse)
-async def update_creator(creator_id: uuid.UUID, creator: CreatorCreate, db: Session = Depends(get_db)):
-    db_creator = db.query(Creator).filter(Creator.id == creator_id).first()
-    if not db_creator:
-        raise HTTPException(status_code=404, detail="Creator not found")
-    
-    for key, value in creator.dict(exclude_unset=True).items():
-        setattr(db_creator, key, value)
-    db_creator.updated_at = datetime.utcnow()
-    
-    db.commit()
-    db.refresh(db_creator)
-    return db_creator
-
-@app.delete("/creators/{creator_id}")
-async def delete_creator(creator_id: uuid.UUID, db: Session = Depends(get_db)):
-    db_creator = db.query(Creator).filter(Creator.id == creator_id).first()
-    if not db_creator:
-        raise HTTPException(status_code=404, detail="Creator not found")
-    
-    db.delete(db_creator)
-    db.commit()
-    return {"message": "Creator deleted successfully"}
-
-# ========== CAMPAIGNS ENDPOINTS ==========
-
-@app.post("/campaigns", response_model=CampaignResponse)
-async def create_campaign(campaign: CampaignCreate, db: Session = Depends(get_db)):
-    commission_amount = None
-    if campaign.collab_type == "paid" and campaign.campaign_value and campaign.commission_percentage:
-        commission_amount = campaign.campaign_value * (campaign.commission_percentage / 100)
-    
-    db_campaign = Campaign(**campaign.dict(), commission_amount=commission_amount)
-    db.add(db_campaign)
-    db.commit()
-    db.refresh(db_campaign)
-    return db_campaign
-
-@app.get("/campaigns", response_model=List[CampaignResponse])
-async def get_campaigns(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(10, ge=1, le=100),
-    status: Optional[str] = None,
-    brand_id: Optional[str] = None,
-    creator_id: Optional[str] = None,
-    db: Session = Depends(get_db)
-):
-    query = db.query(Campaign)
-    if status:
-        query = query.filter(Campaign.status == status)
-    if brand_id:
-        query = query.filter(Campaign.brand_id == uuid.UUID(brand_id))
-    if creator_id:
-        query = query.filter(Campaign.creator_id == uuid.UUID(creator_id))
-    return query.offset(skip).limit(limit).all()
-
-@app.get("/campaigns/{campaign_id}", response_model=CampaignResponse)
-async def get_campaign(campaign_id: uuid.UUID, db: Session = Depends(get_db)):
-    db_campaign = db.query(Campaign).filter(Campaign.id == campaign_id).first()
-    if not db_campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-    return db_campaign
-
-@app.put("/campaigns/{campaign_id}", response_model=CampaignResponse)
-async def update_campaign(campaign_id: uuid.UUID, campaign: CampaignCreate, db: Session = Depends(get_db)):
-    db_campaign = db.query(Campaign).filter(Campaign.id == campaign_id).first()
-    if not db_campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-    
-    for key, value in campaign.dict(exclude_unset=True).items():
-        setattr(db_campaign, key, value)
-    db_campaign.updated_at = datetime.utcnow()
-    
-    db.commit()
-    db.refresh(db_campaign)
-    return db_campaign
-
-@app.delete("/campaigns/{campaign_id}")
-async def delete_campaign(campaign_id: uuid.UUID, db: Session = Depends(get_db)):
-    db_campaign = db.query(Campaign).filter(Campaign.id == campaign_id).first()
-    if not db_campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-    
-    db.delete(db_campaign)
-    db.commit()
-    return {"message": "Campaign deleted successfully"}
-
-# ========== ANALYTICS ==========
-
+# ============ ANALYTICS ============
 @app.get("/analytics/revenue")
-async def revenue_analytics(db: Session = Depends(get_db)):
-    paid_campaigns = db.query(Campaign).filter(
-        and_(Campaign.collab_type == "paid", Campaign.status == "completed")
-    ).all()
-    
-    barter_campaigns = db.query(Campaign).filter(
-        and_(Campaign.collab_type == "barter", Campaign.status == "completed")
-    ).all()
-    
-    total_commission = sum(float(c.commission_amount or 0) for c in paid_campaigns)
-    total_flat_fee = sum(float(c.flat_fee_amount or 0) for c in barter_campaigns)
-    
-    return {
-        "total_commission_revenue": total_commission,
-        "total_flat_fee_revenue": total_flat_fee,
-        "total_revenue": total_commission + total_flat_fee,
-        "paid_campaigns_completed": len(paid_campaigns),
-        "barter_campaigns_completed": len(barter_campaigns)
-    }
+async def get_revenue_analytics():
+    """Get revenue analytics"""
+    return {"status": "analytics_endpoint", "message": "Analytics implementation pending"}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=HOST, port=PORT)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
