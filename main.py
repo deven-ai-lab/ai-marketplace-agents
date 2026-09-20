@@ -132,7 +132,7 @@ client = Anthropic()
 
 # ============ HEALTH CHECK ============
 @app.get("/health")
-async def health_check(db: Session = None):
+async def health_check():
     """Health check endpoint"""
     try:
         if DATABASE_URL:
