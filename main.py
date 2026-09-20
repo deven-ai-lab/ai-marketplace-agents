@@ -1,15 +1,30 @@
+import os
+import uuid
+import json
+from datetime import datetime
+from typing import List, Optional
+
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, text
-from typing import List, Optional
-import uuid
-from datetime import datetime
 from pydantic import BaseModel
+import anthropic
+
 from config import engine, SessionLocal, get_db, HOST, PORT, DEBUG
 from models import Base, Brand, Creator, Campaign
 
 app = FastAPI(title="AI-to-AI Marketplace API", version="1.0.0")
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ========== PYDANTIC SCHEMAS ==========
 
@@ -106,6 +121,15 @@ class CampaignResponse(CampaignCreate):
     class Config:
         from_attributes = True
 
+class SteveRequest(BaseModel):
+    brand_id: str
+    brand_name: str
+    budget: int
+    timeline_days: int
+    niche: str
+    requirements: str
+    target_audience: Optional[str] = None
+
 # ========== HEALTH CHECK ==========
 
 @app.get("/health")
@@ -118,54 +142,62 @@ async def health_check():
     except Exception as e:
         return {"status": "degraded", "database": "disconnected", "error": str(e)}
 
-# ========== N8N INTEGRATION ENDPOINTS ==========
+# ========== STEVE - BRAND MANAGER AGENT ==========
 
-@app.post("/create-brand-from-sheet")
-async def create_brand_from_sheet(brand: BrandCreate, db: Session = Depends(get_db)):
-    """Create a brand from Google Sheets via N8N workflow"""
+@app.post("/agent/steve")
+async def steve_agent(request: SteveRequest):
+    """Steve - Brand Manager Agent"""
     try:
-        db_brand = Brand(**brand.dict())
-        db.add(db_brand)
-        db.commit()
-        db.refresh(db_brand)
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            return {"status": "error", "detail": "ANTHROPIC_API_KEY not set"}
+        
+        client = anthropic.Anthropic(api_key=api_key)
+        
+        system_prompt = """You are Steve, Brand Manager Agent. Analyze brand briefs and return ONLY a JSON object with these fields:
+{
+  "feasibility_score": (1-10),
+  "strategy": "brief strategy description",
+  "recommended_creators_count": (number),
+  "email_template": "draft email to send",
+  "next_steps": ["step1", "step2"],
+  "flags_for_deven": ["flag1", "flag2"]
+}
+
+No other text, just JSON."""
+
+        user_message = f"""Analyze this brand brief:
+
+Brand: {request.brand_name}
+Budget: ₹{request.budget:,}
+Timeline: {request.timeline_days} days
+Niche: {request.niche}
+Requirements: {request.requirements}
+Target Audience: {request.target_audience or 'Not specified'}
+
+Return ONLY JSON object."""
+
+        message = client.messages.create(
+            model="claude-opus-5",
+            max_tokens=1500,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_message}]
+        )
+
+        response_text = message.content[0].text
+        
+        try:
+            strategy = json.loads(response_text)
+        except json.JSONDecodeError:
+            strategy = {"raw_response": response_text}
+        
         return {
-            "success": True,
-            "brand": {
-                "id": str(db_brand.id),
-                "name": db_brand.name,
-                "industry": db_brand.industry,
-                "email": db_brand.email,
-                "budget": float(db_brand.budget) if db_brand.budget else None,
-                "status": db_brand.status
-            },
-            "message": "Brand created successfully"
+            "status": "success",
+            "brand_id": request.brand_id,
+            "strategy": strategy
         }
     except Exception as e:
-        db.rollback()
-        return {"success": False, "error": str(e), "message": "Failed to create brand"}
-
-@app.post("/create-creator-from-sheet")
-async def create_creator_from_sheet(creator: CreatorCreate, db: Session = Depends(get_db)):
-    """Create a creator from Google Sheets via N8N workflow"""
-    try:
-        db_creator = Creator(**creator.dict())
-        db.add(db_creator)
-        db.commit()
-        db.refresh(db_creator)
-        return {
-            "success": True,
-            "creator": {
-                "id": str(db_creator.id),
-                "name": db_creator.name,
-                "niche": db_creator.niche,
-                "location": db_creator.location,
-                "availability_status": db_creator.availability_status
-            },
-            "message": "Creator created successfully"
-        }
-    except Exception as e:
-        db.rollback()
-        return {"success": False, "error": str(e), "message": "Failed to create creator"}
+        return {"status": "error", "detail": str(e)}
 
 # ========== BRANDS ENDPOINTS ==========
 
@@ -361,58 +393,6 @@ async def revenue_analytics(db: Session = Depends(get_db)):
         "paid_campaigns_completed": len(paid_campaigns),
         "barter_campaigns_completed": len(barter_campaigns)
     }
-
-# ========== STEVE - BRAND MANAGER AGENT ==========
-
-import anthropic
-import json
-import os
-
-class SteveRequest(BaseModel):
-    brand_id: str
-    brand_name: str
-    budget: int
-    timeline_days: int
-    niche: str
-    requirements: str
-    target_audience: Optional[str] = None
-
-@app.post("/agent/steve")
-async def steve_agent(request: SteveRequest):
-    """Steve - Brand Manager Agent"""
-    try:
-        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        
-        system_prompt = """You are Steve, Brand Manager Agent. Analyze brand briefs and return ONLY JSON with:
-- feasibility_score (1-10)
-- strategy (brief summary)
-- recommended_creators_count
-- email_template
-- next_steps (list)
-- flags_for_deven (list)"""
-
-        user_message = f"""Brand: {request.brand_name}
-Budget: ₹{request.budget:,}
-Timeline: {request.timeline_days} days
-Niche: {request.niche}
-Requirements: {request.requirements}
-Target: {request.target_audience or 'Not specified'}
-
-Return ONLY JSON."""
-
-        message = client.messages.create(
-            model="claude-opus-5",
-            max_tokens=1000,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_message}]
-        )
-
-        response_text = message.content[0].text
-        strategy = json.loads(response_text)
-        
-        return {"status": "success", "brand_id": request.brand_id, "strategy": strategy}
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
