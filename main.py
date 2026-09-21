@@ -1,31 +1,36 @@
 import os
+import re
 import uuid
 import json
-import re
+import asyncio
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Callable
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, text
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import sessionmaker
 from pydantic import BaseModel
-from anthropic import Anthropic
+from anthropic import AsyncAnthropic
 
-# Configuration
+# ============ CONFIGURATION ============
 DATABASE_URL = os.getenv("DATABASE_URL")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 PORT = int(os.getenv("PORT", 8000))
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
-# Initialize FastAPI app
+EMAIL_MODEL = "claude-sonnet-5"   # Model used for all pitch emails
+BATCH_SIZE = 5                    # Items per Claude call (quality sweet spot)
+MAX_CONCURRENT = 5                # Batches running at the same time (protects rate limits)
+MAX_TOKENS = 16000                # Room for adaptive thinking + emails
+
+# ============ APP SETUP ============
 app = FastAPI(
     title="AI Marketplace Agents",
     description="Steve (Brand Manager), Fred (Matcher), Aditya (Creator Manager)",
-    version="1.0.0"
+    version="1.1.0"
 )
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,12 +39,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Database setup
+# ============ DATABASE ============
 engine = create_engine(DATABASE_URL, echo=DEBUG)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# Database models
+
 class Brand(Base):
     __tablename__ = "brands"
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -60,6 +65,7 @@ class Brand(Base):
     approval_status = Column(String, default="pending")
     created_at = Column(DateTime, default=datetime.utcnow)
 
+
 class Creator(Base):
     __tablename__ = "creators"
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -75,6 +81,7 @@ class Creator(Base):
     restrictions = Column(Text, nullable=True)
     min_budget = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
 
 class Match(Base):
     __tablename__ = "matches"
@@ -94,10 +101,10 @@ class Match(Base):
     approval_status = Column(String, default="pending")
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# Create tables
+
 Base.metadata.create_all(bind=engine)
 
-# Pydantic models
+# ============ PYDANTIC MODELS ============
 class PitchBrandInput(BaseModel):
     brand_id: str
     brand_name: str
@@ -107,9 +114,11 @@ class PitchBrandInput(BaseModel):
     website: Optional[str] = None
     basic_info: str
 
+
 class BatchPitchRequest(BaseModel):
     action: str
     brands: List[PitchBrandInput]
+
 
 class BrandResponse(BaseModel):
     brand_id: str
@@ -118,6 +127,7 @@ class BrandResponse(BaseModel):
     pitch_email: str
     email_sent_date: str
     status: str
+
 
 class PitchCreatorInput(BaseModel):
     creator_id: str
@@ -131,9 +141,11 @@ class PitchCreatorInput(BaseModel):
     engagement_rate: Optional[float] = None
     comments: Optional[str] = None
 
+
 class BatchCreatorPitchRequest(BaseModel):
     action: str
     creators: List[PitchCreatorInput]
+
 
 class CreatorResponse(BaseModel):
     creator_id: str
@@ -142,6 +154,7 @@ class CreatorResponse(BaseModel):
     pitch_email: str
     email_sent_date: str
     status: str
+
 
 class CampaignAnalysisRequest(BaseModel):
     brand_id: str
@@ -152,8 +165,135 @@ class CampaignAnalysisRequest(BaseModel):
     requirements: str
     target_audience: Optional[str] = None
 
-# Initialize Anthropic client
-client = Anthropic()
+
+# ============ CLAUDE HELPERS ============
+async_client = AsyncAnthropic()
+
+
+async def call_claude(system_prompt: str, user_message: str) -> str:
+    """
+    Call Claude and return only the text output.
+    - Skips thinking blocks (adaptive thinking is on by default)
+    - Fails loudly if output was cut off by max_tokens
+    """
+    response = await async_client.messages.create(
+        model=EMAIL_MODEL,
+        max_tokens=MAX_TOKENS,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_message}]
+    )
+
+    output = "".join(
+        block.text for block in response.content
+        if getattr(block, "type", None) == "text"
+    ).strip()
+
+    if response.stop_reason == "max_tokens":
+        raise Exception(f"Output cut off at max_tokens={MAX_TOKENS}")
+    if not output:
+        raise Exception(f"No text returned (stop_reason={response.stop_reason})")
+
+    return output
+
+
+def clean_json_text(response_text: str) -> str:
+    """Remove markdown code fences if present"""
+    response_text = response_text.strip()
+    if response_text.startswith("```json"):
+        response_text = response_text[7:]
+    if response_text.startswith("```"):
+        response_text = response_text[3:]
+    if response_text.endswith("```"):
+        response_text = response_text[:-3]
+    return response_text.strip()
+
+
+def parse_pitches(response_text: str, id_key: str) -> list:
+    """Parse Claude's JSON array, with repair fallbacks"""
+    response_text = clean_json_text(response_text)
+
+    try:
+        return json.loads(response_text)
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback 1: fix unescaped quotes inside pitch_email
+    repaired = response_text.replace('\\"', '__ESCAPED_QUOTE__')
+    repaired = re.sub(
+        r'"pitch_email":\s*"([^"]*)"',
+        lambda m: f'"pitch_email": "{m.group(1).replace(chr(34), chr(92) + chr(34))}"',
+        repaired
+    )
+    repaired = repaired.replace('__ESCAPED_QUOTE__', '\\"')
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback 2: extract individual objects
+    pitches = []
+    pattern = r'\{[^}]*?"' + id_key + r'"[^}]*?"pitch_email"[^}]*?\}'
+    for match in re.findall(pattern, response_text, re.DOTALL):
+        try:
+            pitches.append(json.loads(match))
+        except json.JSONDecodeError:
+            pass
+    return pitches
+
+
+async def generate_pitches_parallel(
+    items: list,
+    id_key: str,
+    format_item: Callable,
+    system_prompt: str,
+    label: str
+) -> dict:
+    """
+    Shared engine for Steve and Aditya:
+    1. Split items into batches of BATCH_SIZE
+    2. Run batches in parallel (max MAX_CONCURRENT at once)
+    3. Retry any missing item individually (also in parallel)
+    Returns {item_id: pitch_email}
+    """
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+
+    async def run_batch(batch: list) -> list:
+        items_text = "\n\n".join(format_item(i, item) for i, item in enumerate(batch))
+        user_message = f"""Generate pitch emails for ALL {len(batch)} {label} provided below. Return exactly {len(batch)} entries in the JSON array - one for each.
+
+{items_text}
+
+Do not skip anyone. Return ONLY the JSON array, no other text."""
+        async with semaphore:
+            try:
+                return parse_pitches(await call_claude(system_prompt, user_message), id_key)
+            except Exception as e:
+                print(f"[{label}] batch failed ({[getattr(x, id_key) for x in batch]}): {e}")
+                return []
+
+    valid_ids = {getattr(item, id_key) for item in items}
+    pitch_map = {}
+
+    def collect(results: list):
+        for batch_pitches in results:
+            for pitch in batch_pitches:
+                pid = pitch.get(id_key)
+                # Keep only IDs we actually sent, first valid pitch wins
+                if pid in valid_ids and pid not in pitch_map and pitch.get("pitch_email"):
+                    pitch_map[pid] = pitch["pitch_email"]
+
+    # Pass 1: all batches in parallel
+    batches = [items[i:i + BATCH_SIZE] for i in range(0, len(items), BATCH_SIZE)]
+    collect(await asyncio.gather(*(run_batch(b) for b in batches)))
+
+    # Pass 2: retry missing items one by one, in parallel
+    missing = [item for item in items if getattr(item, id_key) not in pitch_map]
+    if missing:
+        print(f"[{label}] retrying {len(missing)} missing: {[getattr(x, id_key) for x in missing]}")
+        collect(await asyncio.gather(*(run_batch([m]) for m in missing)))
+
+    return pitch_map
+
 
 # ============ HEALTH CHECK ============
 @app.get("/health")
@@ -162,40 +302,16 @@ async def health_check():
     try:
         if DATABASE_URL:
             db = SessionLocal()
-            db.execute("SELECT 1")
+            db.execute(text("SELECT 1"))
             db.close()
             return {"status": "healthy", "database": "connected"}
     except Exception as e:
         return {"status": "unhealthy", "database": "disconnected", "error": str(e)}
     return {"status": "healthy"}
 
+
 # ============ STEVE: BRAND MANAGER AGENT ============
-
-@app.post("/agent/steve/generate-pitches-batch")
-async def generate_pitches_batch(request: BatchPitchRequest):
-    """
-    STEVE: Batch generate pitch emails for multiple brands
-    Input: Array of brands with basic info
-    Output: Array of pitch emails ready to send
-    Model: Claude Opus-5
-    """
-    try:
-        if request.action != "send_pitch_emails_batch":
-            raise HTTPException(status_code=400, detail="Invalid action")
-
-        # Prepare brands data for Claude
-        brands_text = "\n\n".join([
-            f"""Brand #{i+1}:
-- ID: {brand.brand_id}
-- Name: {brand.brand_name}
-- Industry: {brand.industry}
-- Email: {brand.email}
-- Basic Info: {brand.basic_info}"""
-            for i, brand in enumerate(request.brands)
-        ])
-
-        # System prompt for batch pitch generation
-        system_prompt = """You are Steve, the Brand Manager Agent for an AI-powered influencer marketing agency.
+STEVE_SYSTEM_PROMPT = """You are Steve, the Brand Manager Agent for an AI-powered influencer marketing agency.
 
 Your role: Generate compelling pitch emails to brands interested in creator partnerships.
 
@@ -214,7 +330,9 @@ Email must be:
 - Personalized to their industry
 - Include a clear call-to-action
 
-IMPORTANT: Return ONLY valid JSON array. No preamble, no explanation.
+CRITICAL REQUIREMENT: Return exactly as many pitch emails as brands provided. Do NOT skip anyone.
+
+IMPORTANT: Return ONLY a valid JSON array. No preamble, no explanation.
 
 Format:
 [
@@ -222,110 +340,64 @@ Format:
     "brand_id": "NIKE-001",
     "brand_name": "Nike India",
     "pitch_email": "Subject: Creator Partnership Opportunity - Nike India\\n\\nDear Nike Team,..."
-  },
-  {
-    "brand_id": "ADIDAS-001",
-    "brand_name": "Adidas India",
-    "pitch_email": "Subject: Creator Partnership Opportunity - Adidas India\\n\\nDear Adidas Team,..."
   }
 ]
 """
 
-        user_message = f"""Generate pitch emails for these brands:
 
-{brands_text}
+def format_brand(i: int, brand: PitchBrandInput) -> str:
+    return f"""Brand #{i+1}:
+- ID: {brand.brand_id}
+- Name: {brand.brand_name}
+- Industry: {brand.industry}
+- Email: {brand.email}
+- Website: {brand.website}
+- Basic Info: {brand.basic_info}"""
 
-For each brand, create a personalized pitch email. Return ONLY the JSON array, no other text."""
 
-        # Call Claude API
-        response = client.messages.create(
-            model="claude-opus-5",
-            max_tokens=4000,
-            system=system_prompt,
-            messages=[
-                {"role": "user", "content": user_message}
-            ]
+@app.post("/agent/steve/generate-pitches-batch")
+async def generate_pitches_batch(request: BatchPitchRequest):
+    """
+    STEVE: Generate pitch emails for brands.
+    Batches of 5, run in parallel, missing brands retried individually.
+    """
+    if request.action != "send_pitch_emails_batch":
+        raise HTTPException(status_code=400, detail="Invalid action")
+
+    try:
+        pitch_map = await generate_pitches_parallel(
+            request.brands, "brand_id", format_brand, STEVE_SYSTEM_PROMPT, "brands"
         )
 
-        # Extract and parse response
-        if not response.content or not response.content[0].text:
-            raise Exception("Empty response from Claude")
-        
-        response_text = response.content[0].text.strip()
-        
-        # Clean response (remove markdown code blocks if present)
-        if response_text.startswith("```json"):
-            response_text = response_text[7:]
-        if response_text.startswith("```"):
-            response_text = response_text[3:]
-        if response_text.endswith("```"):
-            response_text = response_text[:-3]
-        
-        response_text = response_text.strip()
-        
-        # Parse JSON
-        try:
-            pitches = json.loads(response_text)
-        except json.JSONDecodeError:
-            # Try to fix common escaping issues
-            response_text = response_text.replace('\\"', '__ESCAPED_QUOTE__')
-            response_text = re.sub(r'"pitch_email":\s*"([^"]*)"', lambda m: f'"pitch_email": "{m.group(1).replace(chr(34), chr(92) + chr(34))}"', response_text)
-            response_text = response_text.replace('__ESCAPED_QUOTE__', '\\"')
-            
-            try:
-                pitches = json.loads(response_text)
-            except json.JSONDecodeError:
-                raise json.JSONDecodeError("Could not parse Claude response", response_text, 0)
-
-        # Format response with metadata
-        db = SessionLocal()
-        results = []
         email_sent_date = datetime.utcnow().isoformat()
-
-        for pitch in pitches:
-            result = {
-                "brand_id": pitch.get("brand_id"),
-                "brand_name": pitch.get("brand_name"),
-                "email": next((b.email for b in request.brands if b.brand_id == pitch.get("brand_id")), ""),
-                "pitch_email": pitch.get("pitch_email"),
-                "email_sent_date": email_sent_date,
-                "status": "pitch_generated"
-            }
-            results.append(BrandResponse(**result))
-
-        db.close()
+        results = [
+            BrandResponse(
+                brand_id=b.brand_id,
+                brand_name=b.brand_name,
+                email=b.email or "",
+                pitch_email=pitch_map[b.brand_id],
+                email_sent_date=email_sent_date,
+                status="pitch_generated"
+            ).dict()
+            for b in request.brands if b.brand_id in pitch_map
+        ]
+        failed_ids = [b.brand_id for b in request.brands if b.brand_id not in pitch_map]
 
         return {
-            "status": "success",
+            "status": "success" if not failed_ids else "partial_success",
             "action": "send_pitch_emails_batch",
             "total_brands": len(request.brands),
-            "pitches": [r.dict() for r in results]
+            "total_generated": len(results),
+            "failed_ids": failed_ids,
+            "pitches": results
         }
 
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse Claude response: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating brand pitches: {str(e)}")
 
 
 # ============ ADITYA: CREATOR MANAGER AGENT ============
-
-@app.post("/agent/aditya/generate-pitches-batch")
-async def aditya_generate_creator_pitches(request: BatchCreatorPitchRequest):
-    """
-    ADITYA: Batch generate pitch emails for multiple creators
-    Input: Array of creators with basic info
-    Output: Array of pitch emails ready to send (explaining brand collaboration opportunity)
-    
-    Uses batch processing: splits large batches into smaller chunks (max 6 per batch)
-    Model: Claude Sonnet-5
-    """
-    try:
-        if request.action != "send_creator_pitches_batch":
-            raise HTTPException(status_code=400, detail="Invalid action")
-
-        # System prompt for batch pitch generation
-        system_prompt = """You are Aditya, the Creator Manager Agent for an AI-powered influencer marketing agency.
+ADITYA_SYSTEM_PROMPT = """You are Aditya, the Creator Manager Agent for an AI-powered influencer marketing agency.
 
 Your role: Generate compelling pitch emails to creators interested in brand collaborations.
 
@@ -344,9 +416,9 @@ Email must be:
 - Personalized to their platform and niche
 - Include a clear call-to-action
 
-CRITICAL REQUIREMENT: You MUST return exactly as many pitch emails as creators provided. Count the creators and ensure every single one is included in the JSON array. Do NOT skip anyone.
+CRITICAL REQUIREMENT: Return exactly as many pitch emails as creators provided. Do NOT skip anyone.
 
-IMPORTANT: Return ONLY valid JSON array. No preamble, no explanation.
+IMPORTANT: Return ONLY a valid JSON array. No preamble, no explanation.
 
 Format:
 [
@@ -354,26 +426,13 @@ Format:
     "creator_id": "CREATOR-001",
     "creator_name": "Ali Khan",
     "pitch_email": "Subject: Brand Collaboration Opportunity for @alikhan\\n\\nHi Ali,..."
-  },
-  {
-    "creator_id": "CREATOR-002",
-    "creator_name": "Priya Singh",
-    "pitch_email": "Subject: Creator Partnership Opportunity - @priyasingh\\n\\nHi Priya,..."
   }
 ]
 """
 
-        # Split creators into batches of 6 (max) to avoid Claude truncation
-        batch_size = 6
-        all_pitches = []
-        
-        for batch_start in range(0, len(request.creators), batch_size):
-            batch_end = min(batch_start + batch_size, len(request.creators))
-            batch_creators = request.creators[batch_start:batch_end]
-            
-            # Prepare creators data for this batch
-            creators_text = "\n\n".join([
-                f"""Creator #{i+1}:
+
+def format_creator(i: int, creator: PitchCreatorInput) -> str:
+    return f"""Creator #{i+1}:
 - ID: {creator.creator_id}
 - Name: {creator.creator_name}
 - Platform: {creator.platform}
@@ -381,95 +440,47 @@ Format:
 - Email: {creator.email}
 - Followers: {creator.follower_count}
 - Engagement Rate: {creator.engagement_rate}%
-- Basic Info: {creator.basic_info}"""
-                for i, creator in enumerate(batch_creators)
-            ])
+- Basic Info: {creator.basic_info}
+- Notes: {creator.comments}"""
 
-            user_message = f"""Generate pitch emails for ALL {len(batch_creators)} creators provided below. You must return exactly {len(batch_creators)} entries in the JSON array - one for each creator.
 
-{creators_text}
+@app.post("/agent/aditya/generate-pitches-batch")
+async def aditya_generate_creator_pitches(request: BatchCreatorPitchRequest):
+    """
+    ADITYA: Generate pitch emails for creators.
+    Batches of 5, run in parallel, missing creators retried individually.
+    """
+    if request.action != "send_creator_pitches_batch":
+        raise HTTPException(status_code=400, detail="Invalid action")
 
-MANDATORY: Do not skip anyone. Generate a pitch for every single creator listed. Return ONLY the JSON array with ALL {len(batch_creators)} pitches, no other text."""
+    try:
+        pitch_map = await generate_pitches_parallel(
+            request.creators, "creator_id", format_creator, ADITYA_SYSTEM_PROMPT, "creators"
+        )
 
-            # Call Claude API for this batch with Sonnet-5
-            response = client.messages.create(
-                model="claude-sonnet-5",
-                max_tokens=4000,
-                system=system_prompt,
-                messages=[
-                    {"role": "user", "content": user_message}
-                ]
-            )
-
-            # Extract and parse response
-            if not response.content or not response.content[0].text:
-                raise Exception(f"Empty response from Claude for batch {batch_start}-{batch_end}")
-            
-            response_text = response.content[0].text.strip()
-            
-            # Clean response (remove markdown code blocks if present)
-            if response_text.startswith("```json"):
-                response_text = response_text[7:]
-            if response_text.startswith("```"):
-                response_text = response_text[3:]
-            if response_text.endswith("```"):
-                response_text = response_text[:-3]
-            
-            response_text = response_text.strip()
-            
-            # Repair common JSON issues in Claude's response
-            try:
-                batch_pitches = json.loads(response_text)
-            except json.JSONDecodeError:
-                # Try to fix common escaping issues
-                response_text = response_text.replace('\\"', '__ESCAPED_QUOTE__')
-                response_text = re.sub(r'"pitch_email":\s*"([^"]*)"', lambda m: f'"pitch_email": "{m.group(1).replace(chr(34), chr(92) + chr(34))}"', response_text)
-                response_text = response_text.replace('__ESCAPED_QUOTE__', '\\"')
-                
-                try:
-                    batch_pitches = json.loads(response_text)
-                except json.JSONDecodeError:
-                    # Last resort: try to extract and repair individual pitch objects
-                    pitch_matches = re.findall(r'\{[^}]*?"creator_id"[^}]*?"pitch_email"[^}]*?\}', response_text, re.DOTALL)
-                    batch_pitches = []
-                    for match in pitch_matches:
-                        try:
-                            batch_pitches.append(json.loads(match))
-                        except:
-                            pass
-                    
-                    if not batch_pitches:
-                        raise json.JSONDecodeError("Could not repair or parse Claude response", response_text, 0)
-            
-            all_pitches.extend(batch_pitches)
-
-        # Format response with metadata
-        db = SessionLocal()
-        results = []
         email_sent_date = datetime.utcnow().isoformat()
-
-        for pitch in all_pitches:
-            result = {
-                "creator_id": pitch.get("creator_id"),
-                "creator_name": pitch.get("creator_name"),
-                "email": next((c.email for c in request.creators if c.creator_id == pitch.get("creator_id")), ""),
-                "pitch_email": pitch.get("pitch_email"),
-                "email_sent_date": email_sent_date,
-                "status": "pitch_generated"
-            }
-            results.append(CreatorResponse(**result))
-
-        db.close()
+        results = [
+            CreatorResponse(
+                creator_id=c.creator_id,
+                creator_name=c.creator_name,
+                email=c.email or "",
+                pitch_email=pitch_map[c.creator_id],
+                email_sent_date=email_sent_date,
+                status="pitch_generated"
+            ).dict()
+            for c in request.creators if c.creator_id in pitch_map
+        ]
+        failed_ids = [c.creator_id for c in request.creators if c.creator_id not in pitch_map]
 
         return {
-            "status": "success",
+            "status": "success" if not failed_ids else "partial_success",
             "action": "send_creator_pitches_batch",
             "total_creators": len(request.creators),
-            "pitches": [r.dict() for r in results]
+            "total_generated": len(results),
+            "failed_ids": failed_ids,
+            "pitches": results
         }
 
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse Claude response: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating creator pitches: {str(e)}")
 
@@ -488,15 +499,16 @@ async def create_brand(brand: dict):
     finally:
         db.close()
 
+
 @app.get("/brands")
 async def get_brands():
     """Get all brands"""
     db = SessionLocal()
     try:
-        brands = db.query(Brand).all()
-        return brands
+        return db.query(Brand).all()
     finally:
         db.close()
+
 
 @app.get("/brands/{brand_id}")
 async def get_brand(brand_id: str):
@@ -509,6 +521,7 @@ async def get_brand(brand_id: str):
         return brand
     finally:
         db.close()
+
 
 # ============ CREATORS CRUD ============
 @app.post("/creators")
@@ -524,15 +537,16 @@ async def create_creator(creator: dict):
     finally:
         db.close()
 
+
 @app.get("/creators")
 async def get_creators():
     """Get all creators"""
     db = SessionLocal()
     try:
-        creators = db.query(Creator).all()
-        return creators
+        return db.query(Creator).all()
     finally:
         db.close()
+
 
 # ============ MATCHES CRUD ============
 @app.post("/matches")
@@ -548,21 +562,23 @@ async def create_match(match: dict):
     finally:
         db.close()
 
+
 @app.get("/matches")
 async def get_matches():
     """Get all matches"""
     db = SessionLocal()
     try:
-        matches = db.query(Match).all()
-        return matches
+        return db.query(Match).all()
     finally:
         db.close()
+
 
 # ============ ANALYTICS ============
 @app.get("/analytics/revenue")
 async def get_revenue_analytics():
     """Get revenue analytics"""
     return {"status": "analytics_endpoint", "message": "Analytics implementation pending"}
+
 
 if __name__ == "__main__":
     import uvicorn
