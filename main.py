@@ -237,7 +237,7 @@ For each brand, create a personalized pitch email. Return ONLY the JSON array, n
 
         # Call Claude API
         response = client.messages.create(
-            model="claude-opus-5",
+            model="claude-sonnet-5",
             max_tokens=4000,
             system=system_prompt,
             messages=[
@@ -340,7 +340,7 @@ Target Audience: {request.target_audience or 'Not specified'}
 Provide strategic recommendations."""
 
         response = client.messages.create(
-            model="claude-opus-5",
+            model="claude-sonnet-5",
             max_tokens=2000,
             system=system_prompt,
             messages=[
@@ -447,7 +447,7 @@ For each creator, create a personalized pitch email. Return ONLY the JSON array 
 
         # Call Claude API
         response = client.messages.create(
-            model="claude-opus-5",
+            model="claude-sonnet-5",
             max_tokens=4000,
             system=system_prompt,
             messages=[
