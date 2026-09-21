@@ -382,24 +382,12 @@ async def aditya_generate_creator_pitches(request: BatchCreatorPitchRequest):
     ADITYA: Batch generate pitch emails for multiple creators
     Input: Array of creators with basic info
     Output: Array of pitch emails ready to send (explaining brand collaboration opportunity)
+    
+    Uses batch processing: splits large batches into smaller chunks (max 6 per batch)
     """
     try:
         if request.action != "send_creator_pitches_batch":
             raise HTTPException(status_code=400, detail="Invalid action")
-
-        # Prepare creators data for Claude
-        creators_text = "\n\n".join([
-            f"""Creator #{i+1}:
-- ID: {creator.creator_id}
-- Name: {creator.creator_name}
-- Platform: {creator.platform}
-- Handle: {creator.handle}
-- Email: {creator.email}
-- Followers: {creator.follower_count}
-- Engagement Rate: {creator.engagement_rate}%
-- Basic Info: {creator.basic_info}"""
-            for i, creator in enumerate(request.creators)
-        ])
 
         # System prompt for batch pitch generation
         system_prompt = """You are Aditya, the Creator Manager Agent for an AI-powered influencer marketing agency.
@@ -421,8 +409,9 @@ Email must be:
 - Personalized to their platform and niche
 - Include a clear call-to-action
 
+CRITICAL REQUIREMENT: You MUST return exactly as many pitch emails as creators provided. Count the creators and ensure every single one is included in the JSON array. Do NOT skip anyone.
+
 IMPORTANT: Return ONLY valid JSON array. No preamble, no explanation.
-CRITICAL REQUIREMENT: You MUST return exactly as many pitch emails as creators provided. Count them and ensure every single one is included.
 
 Format:
 [
@@ -439,72 +428,93 @@ Format:
 ]
 """
 
-        user_message = f"""Generate pitch emails for ALL {len(request.creators)} creators provided below. You must return exactly {len(request.creators)} entries in the JSON array.
+        # Split creators into batches of 6 (max) to avoid truncation
+        batch_size = 6
+        all_pitches = []
+        
+        for batch_start in range(0, len(request.creators), batch_size):
+            batch_end = min(batch_start + batch_size, len(request.creators))
+            batch_creators = request.creators[batch_start:batch_end]
+            
+            # Prepare creators data for this batch
+            creators_text = "\n\n".join([
+                f"""Creator #{i+1}:
+- ID: {creator.creator_id}
+- Name: {creator.creator_name}
+- Platform: {creator.platform}
+- Handle: {creator.handle}
+- Email: {creator.email}
+- Followers: {creator.follower_count}
+- Engagement Rate: {creator.engagement_rate}%
+- Basic Info: {creator.basic_info}"""
+                for i, creator in enumerate(batch_creators)
+            ])
+
+            user_message = f"""Generate pitch emails for ALL {len(batch_creators)} creators provided below. You must return exactly {len(batch_creators)} entries in the JSON array - one for each creator.
 
 {creators_text}
 
-For each creator, create a personalized pitch email. Return ONLY the JSON array with ALL {len(request.creators)} pitches."""
+MANDATORY: Do not skip anyone. Generate a pitch for every single creator listed. Return ONLY the JSON array with ALL {len(batch_creators)} pitches, no other text."""
 
-        # Call Claude API
-        response = client.messages.create(
-            model="claude-sonnet-5",
-            max_tokens=4000,
-            system=system_prompt,
-            messages=[
-                {"role": "user", "content": user_message}
-            ]
-        )
+            # Call Claude API for this batch with Sonnet-5
+            response = client.messages.create(
+                model="claude-sonnet-5",
+                max_tokens=4000,
+                system=system_prompt,
+                messages=[
+                    {"role": "user", "content": user_message}
+                ]
+            )
 
-        # Extract and parse response
-        if not response.content or not response.content[0].text:
-            raise Exception("Empty response from Claude")
-        
-        response_text = response.content[0].text.strip()
-        
-        # Clean response (remove markdown code blocks if present)
-        if response_text.startswith("```json"):
-            response_text = response_text[7:]
-        if response_text.startswith("```"):
-            response_text = response_text[3:]
-        if response_text.endswith("```"):
-            response_text = response_text[:-3]
-        
-        response_text = response_text.strip()
-        
-        # Repair common JSON issues in Claude's response for creators
-        import re
-        # Fix unescaped quotes inside pitch_email by escaping them properly
-        try:
-            pitches = json.loads(response_text)
-        except json.JSONDecodeError:
-            # Try to fix common escaping issues
-            # Replace any " that's inside pitch_email with \"
-            response_text = response_text.replace('\\"', '__ESCAPED_QUOTE__')
-            response_text = re.sub(r'"pitch_email":\s*"([^"]*)"', lambda m: f'"pitch_email": "{m.group(1).replace(chr(34), chr(92) + chr(34))}"', response_text)
-            response_text = response_text.replace('__ESCAPED_QUOTE__', '\\"')
+            # Extract and parse response
+            if not response.content or not response.content[0].text:
+                raise Exception(f"Empty response from Claude for batch {batch_start}-{batch_end}")
             
+            response_text = response.content[0].text.strip()
+            
+            # Clean response (remove markdown code blocks if present)
+            if response_text.startswith("```json"):
+                response_text = response_text[7:]
+            if response_text.startswith("```"):
+                response_text = response_text[3:]
+            if response_text.endswith("```"):
+                response_text = response_text[:-3]
+            
+            response_text = response_text.strip()
+            
+            # Repair common JSON issues in Claude's response for creators
+            import re
             try:
-                pitches = json.loads(response_text)
+                batch_pitches = json.loads(response_text)
             except json.JSONDecodeError:
-                # Last resort: try to extract and repair individual pitch objects
-                pitch_matches = re.findall(r'\{[^}]*?"creator_id"[^}]*?"pitch_email"[^}]*?\}', response_text, re.DOTALL)
-                pitches = []
-                for match in pitch_matches:
-                    try:
-                        # Try to parse and repair each pitch individually
-                        pitches.append(json.loads(match))
-                    except:
-                        pass
+                # Try to fix common escaping issues
+                response_text = response_text.replace('\\"', '__ESCAPED_QUOTE__')
+                response_text = re.sub(r'"pitch_email":\s*"([^"]*)"', lambda m: f'"pitch_email": "{m.group(1).replace(chr(34), chr(92) + chr(34))}"', response_text)
+                response_text = response_text.replace('__ESCAPED_QUOTE__', '\\"')
                 
-                if not pitches:
-                    raise json.JSONDecodeError("Could not repair or parse Claude response", response_text, 0)
+                try:
+                    batch_pitches = json.loads(response_text)
+                except json.JSONDecodeError:
+                    # Last resort: try to extract and repair individual pitch objects
+                    pitch_matches = re.findall(r'\{[^}]*?"creator_id"[^}]*?"pitch_email"[^}]*?\}', response_text, re.DOTALL)
+                    batch_pitches = []
+                    for match in pitch_matches:
+                        try:
+                            batch_pitches.append(json.loads(match))
+                        except:
+                            pass
+                    
+                    if not batch_pitches:
+                        raise json.JSONDecodeError("Could not repair or parse Claude response", response_text, 0)
+            
+            all_pitches.extend(batch_pitches)
 
         # Format response with metadata
         db = SessionLocal()
         results = []
         email_sent_date = datetime.utcnow().isoformat()
 
-        for pitch in pitches:
+        for pitch in all_pitches:
             result = {
                 "creator_id": pitch.get("creator_id"),
                 "creator_name": pitch.get("creator_name"),
