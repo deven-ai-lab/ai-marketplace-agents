@@ -118,6 +118,30 @@ class BrandResponse(BaseModel):
     email_sent_date: str
     status: str
 
+class PitchCreatorInput(BaseModel):
+    creator_id: str
+    creator_name: str
+    platform: str
+    handle: str
+    email: str
+    phone: Optional[str] = None
+    basic_info: str
+    follower_count: Optional[int] = None
+    engagement_rate: Optional[float] = None
+    comments: Optional[str] = None
+
+class BatchCreatorPitchRequest(BaseModel):
+    action: str
+    creators: List[PitchCreatorInput]
+
+class CreatorResponse(BaseModel):
+    creator_id: str
+    creator_name: str
+    email: str
+    pitch_email: str
+    email_sent_date: str
+    status: str
+
 class CampaignAnalysisRequest(BaseModel):
     brand_id: str
     brand_name: str
@@ -348,6 +372,134 @@ Provide strategic recommendations."""
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error analyzing campaign: {str(e)}")
+
+
+# ============ ADITYA: CREATOR MANAGER AGENT ============
+
+@app.post("/agent/aditya/generate-pitches-batch")
+async def aditya_generate_creator_pitches(request: BatchCreatorPitchRequest):
+    """
+    ADITYA: Batch generate pitch emails for multiple creators
+    Input: Array of creators with basic info
+    Output: Array of pitch emails ready to send (explaining brand collaboration opportunity)
+    """
+    try:
+        if request.action != "send_creator_pitches_batch":
+            raise HTTPException(status_code=400, detail="Invalid action")
+
+        # Prepare creators data for Claude
+        creators_text = "\n\n".join([
+            f"""Creator #{i+1}:
+- ID: {creator.creator_id}
+- Name: {creator.creator_name}
+- Platform: {creator.platform}
+- Handle: {creator.handle}
+- Email: {creator.email}
+- Followers: {creator.follower_count}
+- Engagement Rate: {creator.engagement_rate}%
+- Basic Info: {creator.basic_info}"""
+            for i, creator in enumerate(request.creators)
+        ])
+
+        # System prompt for batch pitch generation
+        system_prompt = """You are Aditya, the Creator Manager Agent for an AI-powered influencer marketing agency.
+
+Your role: Generate compelling pitch emails to content creators interested in brand collaborations.
+
+You represent premium brands looking for authentic creator partnerships across multiple niches.
+
+For each creator provided, generate a professional pitch email that:
+1. Acknowledges their content and niche
+2. Explains the opportunity (work with premium brands)
+3. Highlights benefits (payment, exposure, products)
+4. Asks for their details (minimum budget, restrictions, availability, best-performing content types)
+5. Calls them to action
+
+Email must be:
+- Professional but personable
+- Concise (under 200 words)
+- Personalized to their content style and platform
+- Include a clear call-to-action
+
+IMPORTANT: Return ONLY valid JSON array. No preamble, no explanation.
+
+Format:
+[
+  {
+    "creator_id": "CREATOR_001",
+    "creator_name": "Priya Sharma",
+    "pitch_email": "Subject: Brand Collaboration Opportunity for @priya.lifestyle\\n\\nHi Priya,..."
+  },
+  {
+    "creator_id": "CREATOR_002",
+    "creator_name": "Arjun Tech",
+    "pitch_email": "Subject: Creator Partnership Opportunity - @arjuntech\\n\\nHi Arjun,..."
+  }
+]
+"""
+
+        user_message = f"""Generate pitch emails for these creators:
+
+{creators_text}
+
+For each creator, create a personalized pitch email explaining brand collaboration opportunities. Return ONLY the JSON array, no other text."""
+
+        # Call Claude API
+        response = client.messages.create(
+            model="claude-opus-5",
+            max_tokens=4000,
+            system=system_prompt,
+            messages=[
+                {"role": "user", "content": user_message}
+            ]
+        )
+
+        # Extract and parse response
+        if not response.content or not response.content[0].text:
+            raise Exception("Empty response from Claude")
+        
+        response_text = response.content[0].text.strip()
+        
+        # Clean response (remove markdown code blocks if present)
+        if response_text.startswith("```json"):
+            response_text = response_text[7:]
+        if response_text.startswith("```"):
+            response_text = response_text[3:]
+        if response_text.endswith("```"):
+            response_text = response_text[:-3]
+        
+        response_text = response_text.strip()
+        pitches = json.loads(response_text)
+
+        # Format response with metadata
+        db = SessionLocal()
+        results = []
+        email_sent_date = datetime.utcnow().isoformat()
+
+        for pitch in pitches:
+            result = {
+                "creator_id": pitch.get("creator_id"),
+                "creator_name": pitch.get("creator_name"),
+                "email": next((c.email for c in request.creators if c.creator_id == pitch.get("creator_id")), ""),
+                "pitch_email": pitch.get("pitch_email"),
+                "email_sent_date": email_sent_date,
+                "status": "pitch_generated"
+            }
+            results.append(CreatorResponse(**result))
+
+        db.close()
+
+        return {
+            "status": "success",
+            "action": "send_creator_pitches_batch",
+            "total_creators": len(request.creators),
+            "pitches": [r.dict() for r in results]
+        }
+
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to parse Claude response: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating creator pitches: {str(e)}")
 
 
 # ============ BRANDS CRUD ============
