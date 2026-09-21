@@ -464,6 +464,9 @@ For each creator, create a personalized pitch email explaining brand collaborati
         
         response_text = response.content[0].text.strip()
         
+        # DEBUG: Log first 500 chars of response
+        debug_info = f"Claude response (first 500 chars): {response_text[:500]}"
+        
         # Clean response (remove markdown code blocks if present)
         if response_text.startswith("```json"):
             response_text = response_text[7:]
@@ -481,7 +484,8 @@ For each creator, create a personalized pitch email explaining brand collaborati
             # Log the problematic section for debugging
             error_pos = e.pos
             context = response_text[max(0, error_pos-100):min(len(response_text), error_pos+100)]
-            raise HTTPException(status_code=500, detail=f"JSON parse error at position {error_pos}: {str(e)}. Context: {context}")
+            full_error = f"JSON parse error at position {error_pos}: {str(e)}. Context: {context}. {debug_info}"
+            raise HTTPException(status_code=500, detail=full_error)
 
         # Format response with metadata
         db = SessionLocal()
@@ -511,7 +515,9 @@ For each creator, create a personalized pitch email explaining brand collaborati
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=500, detail=f"Failed to parse Claude response: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating creator pitches: {str(e)}")
+        import traceback
+        error_trace = traceback.format_exc()
+        raise HTTPException(status_code=500, detail=f"Error generating creator pitches: {str(e)}. Trace: {error_trace}")
 
 
 # ============ BRANDS CRUD ============
