@@ -469,7 +469,34 @@ For each creator, create a personalized pitch email. Return ONLY the JSON array,
             response_text = response_text[:-3]
         
         response_text = response_text.strip()
-        pitches = json.loads(response_text)
+        
+        # Repair common JSON issues in Claude's response for creators
+        import re
+        # Fix unescaped quotes inside pitch_email by escaping them properly
+        try:
+            pitches = json.loads(response_text)
+        except json.JSONDecodeError:
+            # Try to fix common escaping issues
+            # Replace any " that's inside pitch_email with \"
+            response_text = response_text.replace('\\"', '__ESCAPED_QUOTE__')
+            response_text = re.sub(r'"pitch_email":\s*"([^"]*)"', lambda m: f'"pitch_email": "{m.group(1).replace(chr(34), chr(92) + chr(34))}"', response_text)
+            response_text = response_text.replace('__ESCAPED_QUOTE__', '\\"')
+            
+            try:
+                pitches = json.loads(response_text)
+            except json.JSONDecodeError:
+                # Last resort: try to extract and repair individual pitch objects
+                pitch_matches = re.findall(r'\{[^}]*?"creator_id"[^}]*?"pitch_email"[^}]*?\}', response_text, re.DOTALL)
+                pitches = []
+                for match in pitch_matches:
+                    try:
+                        # Try to parse and repair each pitch individually
+                        pitches.append(json.loads(match))
+                    except:
+                        pass
+                
+                if not pitches:
+                    raise json.JSONDecodeError("Could not repair or parse Claude response", response_text, 0)
 
         # Format response with metadata
         db = SessionLocal()
