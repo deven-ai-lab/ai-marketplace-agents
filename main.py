@@ -422,6 +422,7 @@ Email must be:
 - Include a clear call-to-action
 
 IMPORTANT: Return ONLY valid JSON array. No preamble, no explanation.
+CRITICAL REQUIREMENT: You MUST return exactly as many pitch emails as creators provided. Count them and ensure every single one is included.
 
 Format:
 [
@@ -438,11 +439,11 @@ Format:
 ]
 """
 
-        user_message = f"""Generate pitch emails for these creators:
+        user_message = f"""Generate pitch emails for ALL {len(request.creators)} creators provided below. You must return exactly {len(request.creators)} entries in the JSON array.
 
 {creators_text}
 
-For each creator, create a personalized pitch email. Return ONLY the JSON array, no other text."""
+For each creator, create a personalized pitch email. Return ONLY the JSON array with ALL {len(request.creators)} pitches."""
 
         # Call Claude API
         response = client.messages.create(
