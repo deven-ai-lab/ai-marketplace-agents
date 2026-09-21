@@ -421,7 +421,11 @@ Email must be:
 - Personalized to their content style and platform
 - Include a clear call-to-action
 
-IMPORTANT: Return ONLY valid JSON array. No preamble, no explanation.
+CRITICAL JSON REQUIREMENTS:
+- Use \\n for line breaks in the email body
+- Escape all double quotes inside the email with \\"
+- Use single quotes where possible to avoid escaping
+- Return ONLY valid JSON array with NO preamble or explanation
 
 Format:
 [
@@ -469,7 +473,15 @@ For each creator, create a personalized pitch email explaining brand collaborati
             response_text = response_text[:-3]
         
         response_text = response_text.strip()
-        pitches = json.loads(response_text)
+        
+        # Parse with better error handling
+        try:
+            pitches = json.loads(response_text)
+        except json.JSONDecodeError as e:
+            # Log the problematic section for debugging
+            error_pos = e.pos
+            context = response_text[max(0, error_pos-100):min(len(response_text), error_pos+100)]
+            raise HTTPException(status_code=500, detail=f"JSON parse error at position {error_pos}: {str(e)}. Context: {context}")
 
         # Format response with metadata
         db = SessionLocal()
