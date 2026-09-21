@@ -1,6 +1,7 @@
 import os
 import uuid
 import json
+import re
 from datetime import datetime
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException
@@ -176,6 +177,7 @@ async def generate_pitches_batch(request: BatchPitchRequest):
     STEVE: Batch generate pitch emails for multiple brands
     Input: Array of brands with basic info
     Output: Array of pitch emails ready to send
+    Model: Claude Opus-5
     """
     try:
         if request.action != "send_pitch_emails_batch":
@@ -260,7 +262,20 @@ For each brand, create a personalized pitch email. Return ONLY the JSON array, n
             response_text = response_text[:-3]
         
         response_text = response_text.strip()
-        pitches = json.loads(response_text)
+        
+        # Parse JSON
+        try:
+            pitches = json.loads(response_text)
+        except json.JSONDecodeError:
+            # Try to fix common escaping issues
+            response_text = response_text.replace('\\"', '__ESCAPED_QUOTE__')
+            response_text = re.sub(r'"pitch_email":\s*"([^"]*)"', lambda m: f'"pitch_email": "{m.group(1).replace(chr(34), chr(92) + chr(34))}"', response_text)
+            response_text = response_text.replace('__ESCAPED_QUOTE__', '\\"')
+            
+            try:
+                pitches = json.loads(response_text)
+            except json.JSONDecodeError:
+                raise json.JSONDecodeError("Could not parse Claude response", response_text, 0)
 
         # Format response with metadata
         db = SessionLocal()
@@ -290,88 +305,7 @@ For each brand, create a personalized pitch email. Return ONLY the JSON array, n
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=500, detail=f"Failed to parse Claude response: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating pitches: {str(e)}")
-
-
-@app.post("/agent/steve")
-async def steve_campaign_analysis(request: CampaignAnalysisRequest):
-    """
-    STEVE: Brand Manager Agent - Analyze campaign briefs
-    Input: Complete brand campaign details
-    Output: Strategy, feasibility, email template, next steps
-    """
-    try:
-        system_prompt = """You are Steve, the Brand Manager Agent for an AI influencer marketing agency.
-
-Your role: Analyze brand campaign briefs and provide strategic recommendations.
-
-You manage relationships with 200+ creators across multiple niches and platforms.
-
-For each brand brief, provide:
-1. Feasibility Score (1-10)
-2. Detailed Strategy
-3. Recommended Creator Count
-4. Draft Email Template
-5. Next Steps
-6. Flags for Manual Review
-
-Return ONLY valid JSON. No other text.
-
-Format:
-{
-  "feasibility_score": 7,
-  "strategy": "Recommended approach...",
-  "recommended_creators_count": 5,
-  "email_template": "Draft email to send to creator...",
-  "next_steps": ["Step 1", "Step 2"],
-  "flags_for_deven": ["Flag 1", "Flag 2"]
-}
-"""
-
-        user_message = f"""Analyze this brand campaign brief:
-
-Brand: {request.brand_name}
-Budget: ₹{request.budget}
-Timeline: {request.timeline_days} days
-Niche: {request.niche}
-Requirements: {request.requirements}
-Target Audience: {request.target_audience or 'Not specified'}
-
-Provide strategic recommendations."""
-
-        response = client.messages.create(
-            model="claude-opus-5",
-            max_tokens=2000,
-            system=system_prompt,
-            messages=[
-                {"role": "user", "content": user_message}
-            ]
-        )
-
-        if not response.content or not response.content[0].text:
-            raise Exception("Empty response from Claude")
-        
-        response_text = response.content[0].text.strip()
-        
-        # Clean response
-        if response_text.startswith("```json"):
-            response_text = response_text[7:]
-        if response_text.startswith("```"):
-            response_text = response_text[3:]
-        if response_text.endswith("```"):
-            response_text = response_text[:-3]
-        
-        response_text = response_text.strip()
-        strategy = json.loads(response_text)
-
-        return {
-            "status": "success",
-            "brand_id": request.brand_id,
-            "strategy": strategy
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error analyzing campaign: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating brand pitches: {str(e)}")
 
 
 # ============ ADITYA: CREATOR MANAGER AGENT ============
@@ -384,6 +318,7 @@ async def aditya_generate_creator_pitches(request: BatchCreatorPitchRequest):
     Output: Array of pitch emails ready to send (explaining brand collaboration opportunity)
     
     Uses batch processing: splits large batches into smaller chunks (max 6 per batch)
+    Model: Claude Sonnet-5
     """
     try:
         if request.action != "send_creator_pitches_batch":
@@ -428,7 +363,7 @@ Format:
 ]
 """
 
-        # Split creators into batches of 6 (max) to avoid truncation
+        # Split creators into batches of 6 (max) to avoid Claude truncation
         batch_size = 6
         all_pitches = []
         
@@ -457,27 +392,14 @@ Format:
 MANDATORY: Do not skip anyone. Generate a pitch for every single creator listed. Return ONLY the JSON array with ALL {len(batch_creators)} pitches, no other text."""
 
             # Call Claude API for this batch with Sonnet-5
-            try:
-                response = client.messages.create(
-                    model="claude-sonnet-5",
-                    max_tokens=4000,
-                    system=system_prompt,
-                    messages=[
-                        {"role": "user", "content": user_message}
-                    ]
-                )
-            except Exception as e:
-                # Log the actual error for debugging
-                print(f"Error with claude-sonnet-5: {str(e)}")
-                # Fallback to Opus if Sonnet not available
-                response = client.messages.create(
-                    model="claude-opus-5",
-                    max_tokens=4000,
-                    system=system_prompt,
-                    messages=[
-                        {"role": "user", "content": user_message}
-                    ]
-                )
+            response = client.messages.create(
+                model="claude-sonnet-5",
+                max_tokens=4000,
+                system=system_prompt,
+                messages=[
+                    {"role": "user", "content": user_message}
+                ]
+            )
 
             # Extract and parse response
             if not response.content or not response.content[0].text:
@@ -495,8 +417,7 @@ MANDATORY: Do not skip anyone. Generate a pitch for every single creator listed.
             
             response_text = response_text.strip()
             
-            # Repair common JSON issues in Claude's response for creators
-            import re
+            # Repair common JSON issues in Claude's response
             try:
                 batch_pitches = json.loads(response_text)
             except json.JSONDecodeError:
