@@ -404,45 +404,45 @@ async def aditya_generate_creator_pitches(request: BatchCreatorPitchRequest):
         # System prompt for batch pitch generation
         system_prompt = """You are Aditya, the Creator Manager Agent for an AI-powered influencer marketing agency.
 
-Your role: Generate pitch emails to content creators about brand collaboration opportunities.
+Your role: Generate compelling pitch emails to creators interested in brand collaborations.
 
-CRITICAL: You MUST return ONLY a valid JSON array. NO preamble, NO explanation, NO extra text.
+You represent premium brands looking for authentic creator partnerships across multiple niches.
 
-For each creator, generate a professional pitch email (150-180 words).
+For each creator provided, generate a professional pitch email that:
+1. Opens with the creator's context
+2. Explains what you do (connect creators with premium brands)
+3. Highlights the opportunity (paid collaborations, exposure, products)
+4. Asks for their details (min budget, restrictions, availability, best format)
+5. Calls them to action
 
-JSON FORMAT RULES (STRICTLY ENFORCE):
-1. Return ONLY the JSON array, nothing else
-2. Escape ALL double quotes inside email text with backslash: \\"
-3. Use \\n for line breaks (NOT actual newlines)
-4. NO apostrophes or fancy quotes - use straight single quotes if needed
-5. NO special characters except basic ASCII
-6. NO emojis, NO accents, NO unicode characters
-7. Keep email text SIMPLE and PLAIN
+Email must be:
+- Professional but friendly
+- Concise (under 200 words)
+- Personalized to their platform and niche
+- Include a clear call-to-action
 
-REQUIRED STRUCTURE:
+IMPORTANT: Return ONLY valid JSON array. No preamble, no explanation.
+
+Format:
 [
   {
-    "creator_id": "CREATOR_001",
-    "creator_name": "Name",
-    "pitch_email": "Subject: Line\\n\\nBody text with \\"quoted text\\" if needed"
+    "creator_id": "CREATOR-001",
+    "creator_name": "Ali Khan",
+    "pitch_email": "Subject: Brand Collaboration Opportunity for @alikhan\\n\\nHi Ali,..."
+  },
+  {
+    "creator_id": "CREATOR-002",
+    "creator_name": "Priya Singh",
+    "pitch_email": "Subject: Creator Partnership Opportunity - @priyasingh\\n\\nHi Priya,..."
   }
 ]
-
-Example email format:
-"Subject: Brand Collaboration Opportunity for @handle\\n\\nHi Creator,\\n\\nI am Aditya from [Agency]. Your content is impressive - [specific detail].\\n\\nWe work with premium brands and looking for authentic creators. Would you be interested in paid collaborations?\\n\\nTo match you with brands, could you share:\\n1. Your minimum budget per collaboration\\n2. Any category restrictions\\n3. Your availability (next 4-6 weeks)\\n4. Best performing content format\\n\\nReply with details and I will send brand opportunities within 48 hours.\\n\\nBest regards,\\nAditya"
-
-IMPORTANT: 
-- Use only plain text
-- Escape quotes with \\"
-- Use \\n for breaks
-- NO line breaks in JSON
-- Return ONLY the JSON array"""
+"""
 
         user_message = f"""Generate pitch emails for these creators:
 
 {creators_text}
 
-For each creator, create a personalized pitch email explaining brand collaboration opportunities. Return ONLY the JSON array, no other text."""
+For each creator, create a personalized pitch email. Return ONLY the JSON array, no other text."""
 
         # Call Claude API
         response = client.messages.create(
@@ -460,9 +460,6 @@ For each creator, create a personalized pitch email explaining brand collaborati
         
         response_text = response.content[0].text.strip()
         
-        # DEBUG: Log first 500 chars of response
-        debug_info = f"Claude response (first 500 chars): {response_text[:500]}"
-        
         # Clean response (remove markdown code blocks if present)
         if response_text.startswith("```json"):
             response_text = response_text[7:]
@@ -472,16 +469,7 @@ For each creator, create a personalized pitch email explaining brand collaborati
             response_text = response_text[:-3]
         
         response_text = response_text.strip()
-        
-        # Parse with better error handling
-        try:
-            pitches = json.loads(response_text)
-        except json.JSONDecodeError as e:
-            # Log the problematic section for debugging
-            error_pos = e.pos
-            context = response_text[max(0, error_pos-100):min(len(response_text), error_pos+100)]
-            full_error = f"JSON parse error at position {error_pos}: {str(e)}. Context: {context}. {debug_info}"
-            raise HTTPException(status_code=500, detail=full_error)
+        pitches = json.loads(response_text)
 
         # Format response with metadata
         db = SessionLocal()
@@ -511,9 +499,7 @@ For each creator, create a personalized pitch email explaining brand collaborati
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=500, detail=f"Failed to parse Claude response: {str(e)}")
     except Exception as e:
-        import traceback
-        error_trace = traceback.format_exc()
-        raise HTTPException(status_code=500, detail=f"Error generating creator pitches: {str(e)}. Trace: {error_trace}")
+        raise HTTPException(status_code=500, detail=f"Error generating creator pitches: {str(e)}")
 
 
 # ============ BRANDS CRUD ============
