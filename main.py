@@ -156,6 +156,15 @@ class CreatorResponse(BaseModel):
     status: str
 
 
+class ParseReplyRequest(BaseModel):
+    contact_id: str                        # brand_id or creator_id
+    contact_name: Optional[str] = None
+    from_email: Optional[str] = None
+    reply_subject: Optional[str] = None
+    reply_body: str
+    original_pitch: Optional[str] = None   # our pitch email, gives Claude context
+
+
 class CampaignAnalysisRequest(BaseModel):
     brand_id: str
     brand_name: str
@@ -483,6 +492,182 @@ async def aditya_generate_creator_pitches(request: BatchCreatorPitchRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating creator pitches: {str(e)}")
+
+
+# ============ REPLY PARSING (STEVE + ADITYA) ============
+VALID_INTENTS = {"interested", "not_interested", "needs_info", "auto_reply", "unsubscribe", "other"}
+
+
+def strip_quoted_reply(body: str) -> str:
+    """Remove the quoted original email so Claude only reads the new reply"""
+    lines = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        # Gmail / Outlook style markers that start the quoted section
+        if re.match(r"^On .+wrote:$", stripped) or stripped.startswith("-----Original Message-----"):
+            break
+        if stripped.startswith(">"):
+            continue
+        lines.append(line)
+    cleaned = "\n".join(lines).strip()
+    return cleaned if cleaned else body.strip()
+
+
+def parse_json_object(response_text: str) -> dict:
+    """Parse a single JSON object from Claude's output"""
+    response_text = clean_json_text(response_text)
+    try:
+        return json.loads(response_text)
+    except json.JSONDecodeError:
+        start, end = response_text.find("{"), response_text.rfind("}")
+        if start != -1 and end > start:
+            return json.loads(response_text[start:end + 1])
+        raise
+
+
+def to_int_or_none(value):
+    try:
+        return int(float(value)) if value not in (None, "") else None
+    except (ValueError, TypeError):
+        return None
+
+
+REPLY_RULES = """
+INTENT (pick exactly one):
+- "interested": wants to proceed or shares details
+- "not_interested": declines
+- "needs_info": asks questions before deciding
+- "auto_reply": out-of-office, automated or bounce message (NOT a real response)
+- "unsubscribe": asks to stop receiving emails
+- "other": anything else
+
+BUDGET RULES:
+- Convert to an integer in INR. "2 lakh" = 200000, "50k" = 50000, "1.5L" = 150000, "1 crore" = 10000000
+- If a foreign currency is used, keep the number and mention the currency in "notes"
+- If not mentioned, use null. Never guess a number.
+
+Only extract what the reply actually says. Use null for anything not stated.
+Return ONLY a valid JSON object. No preamble, no markdown.
+"""
+
+STEVE_PARSE_PROMPT = """You are Steve, Brand Manager Agent at an influencer marketing agency.
+You sent a pitch email to a brand and they replied. Read the reply and extract structured data.
+""" + REPLY_RULES + """
+Format:
+{
+  "intent": "interested",
+  "summary": "One sentence summary of the reply for the founder",
+  "questions": ["Any questions the brand asked"],
+  "budget": 200000,
+  "budget_text": "exact budget wording from the email, or null",
+  "platform": "Instagram, YouTube, etc. or null",
+  "timeline_days": 30,
+  "niche": "creator niche they want, or null",
+  "requirements": "deliverables, audience, location or other requirements, or null",
+  "notes": "anything else important, or null"
+}
+"""
+
+ADITYA_PARSE_PROMPT = """You are Aditya, Creator Manager Agent at an influencer marketing agency.
+You sent a pitch email to a creator and they replied. Read the reply and extract structured data.
+""" + REPLY_RULES + """
+For min_budget, use the lowest amount the creator says they accept per collaboration.
+
+Format:
+{
+  "intent": "interested",
+  "summary": "One sentence summary of the reply for the founder",
+  "questions": ["Any questions the creator asked"],
+  "min_budget": 25000,
+  "budget_text": "exact budget wording from the email, or null",
+  "restrictions": "categories or brands they will not promote, or null",
+  "availability": "when they are available, or null",
+  "best_format": "Reels, Stories, YouTube videos, etc. or null",
+  "notes": "anything else important, or null"
+}
+"""
+
+
+def build_reply_message(request: ParseReplyRequest, contact_label: str) -> str:
+    original = f"\nOUR ORIGINAL PITCH (for context):\n{request.original_pitch}\n" if request.original_pitch else ""
+    return f"""{contact_label}: {request.contact_name or request.contact_id}
+From: {request.from_email or 'unknown'}
+Subject: {request.reply_subject or ''}
+{original}
+THEIR REPLY:
+{strip_quoted_reply(request.reply_body)}
+
+Extract the data and return ONLY the JSON object."""
+
+
+def normalize_intent(parsed: dict) -> str:
+    intent = str(parsed.get("intent", "other")).strip().lower()
+    return intent if intent in VALID_INTENTS else "other"
+
+
+@app.post("/agent/steve/parse-reply")
+async def steve_parse_reply(request: ParseReplyRequest):
+    """
+    STEVE: Read a brand's reply and extract intent + campaign details.
+    Output fields map directly to the brands table.
+    """
+    try:
+        parsed = parse_json_object(
+            await call_claude(STEVE_PARSE_PROMPT, build_reply_message(request, "Brand"))
+        )
+        intent = normalize_intent(parsed)
+
+        return {
+            "status": "success",
+            "contact_type": "brand",
+            "brand_id": request.contact_id,
+            "intent": intent,
+            "is_real_response": intent not in ("auto_reply",),
+            "summary": parsed.get("summary"),
+            "questions": parsed.get("questions") or [],
+            "budget": to_int_or_none(parsed.get("budget")),
+            "budget_text": parsed.get("budget_text"),
+            "platform": parsed.get("platform"),
+            "timeline_days": to_int_or_none(parsed.get("timeline_days")),
+            "niche": parsed.get("niche"),
+            "requirements": parsed.get("requirements"),
+            "notes": parsed.get("notes"),
+            "extracted_data": parsed
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error parsing brand reply: {str(e)}")
+
+
+@app.post("/agent/aditya/parse-reply")
+async def aditya_parse_reply(request: ParseReplyRequest):
+    """
+    ADITYA: Read a creator's reply and extract intent + collaboration terms.
+    Output fields map directly to the creators table.
+    """
+    try:
+        parsed = parse_json_object(
+            await call_claude(ADITYA_PARSE_PROMPT, build_reply_message(request, "Creator"))
+        )
+        intent = normalize_intent(parsed)
+
+        return {
+            "status": "success",
+            "contact_type": "creator",
+            "creator_id": request.contact_id,
+            "intent": intent,
+            "is_real_response": intent not in ("auto_reply",),
+            "summary": parsed.get("summary"),
+            "questions": parsed.get("questions") or [],
+            "min_budget": to_int_or_none(parsed.get("min_budget")),
+            "budget_text": parsed.get("budget_text"),
+            "restrictions": parsed.get("restrictions"),
+            "availability": parsed.get("availability"),
+            "best_format": parsed.get("best_format"),
+            "notes": parsed.get("notes"),
+            "extracted_data": parsed
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error parsing creator reply: {str(e)}")
 
 
 # ============ BRANDS CRUD ============
