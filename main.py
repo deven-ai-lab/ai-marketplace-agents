@@ -854,7 +854,8 @@ Also return:
 - red_flags: suspicious numbers (very few followers, engagement implausible for the size), or null
 - estimated_rate: ONLY when their rate is unknown, a fair INR fee for this work in the Indian market
   given their tier, niche and platform. Otherwise null.
-- anon_summary: one sentence on why they fit, written for the brand. Never include a name, handle,
+- anon_summary: one positive sentence on why they fit, written for the brand. Describe strengths only.
+  Never mention price, budget, fees, concerns or weaknesses, and never include a name, handle,
   or anything that identifies the creator.
 
 Return ONLY a JSON array with one object per creator, no other text:
@@ -897,8 +898,10 @@ def _format_followers(n) -> str:
     n = int(n)
     if n >= 1_000_000:
         return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
+    if n >= 10_000:
         return f"{round(n / 1_000)}K"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
     return str(n)
 
 
@@ -1095,7 +1098,7 @@ Score ALL {len(candidates)} candidates. Return ONLY the JSON array."""
 
         # ---------- Merge scores, drop conflicts, price each creator ----------
         by_id = {c["creator_id"]: c for c in candidates}
-        conflicts, scored = [], []
+        conflicts, scored, estimated_over_budget = [], [], []
         for sc in scores:
             c = by_id.get(sc.get("creator_id"))
             if not c:
@@ -1109,16 +1112,17 @@ Score ALL {len(candidates)} candidates. Return ONLY the JSON array."""
             cost = c["min_budget"] if confirmed else estimated
             concerns = sc.get("concerns")
 
+            # An estimate above the stretch budget rules the creator out, like a confirmed high price
+            if not confirmed and estimated is not None and estimated > cap_stretch:
+                estimated_over_budget.append({"creator_id": c["creator_id"], "estimated_rate": estimated})
+                continue
+
             if pricing_model == "per_collab":
                 effective = cost if cost is not None else cap_target
                 if effective <= cap_target:
                     is_stretch, payout = False, effective
-                elif effective <= cap_stretch:
-                    is_stretch, payout = True, effective
                 else:
-                    # Only possible for unconfirmed creators: estimate is above budget
-                    is_stretch, payout = True, cap_stretch
-                    concerns = ((concerns + "; ") if concerns else "") + "Estimated rate is above budget"
+                    is_stretch, payout = True, effective
             else:
                 is_stretch = False
                 payout = cost if cost is not None else cap_target // max(shortlist_size, 1)
@@ -1249,15 +1253,20 @@ Score ALL {len(candidates)} candidates. Return ONLY the JSON array."""
             "why_this_creator": _anonymize(x["anon_summary"], x),
         } for i, x in enumerate(shortlist)]
 
+        slots_unfilled = max((slots or 0) - len(shortlist), 0)
+
         return {
             "status": "success",
             "campaign_id": request.campaign_id,
             "brand_name": campaign["brand_name"],
-            "needs_recruiting": len(shortlist) < min(3, max(shortlist_size, slots or 1)),
+            "needs_recruiting": slots_unfilled > 0 or len(shortlist) < min(3, max(shortlist_size, slots or 1)),
+            "slots_requested": slots,
+            "slots_unfilled": slots_unfilled,
             "candidates_considered": len(creators),
             "candidates_scored": len(candidates),
             "filters_excluded": excluded,
             "excluded_by_fred": conflicts,
+            "excluded_estimated_over_budget": estimated_over_budget,
             "budget_math": budget_math,
             "internal_view": internal_view,
             "anonymized_view": anonymized_view,
