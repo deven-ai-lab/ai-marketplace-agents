@@ -84,25 +84,6 @@ class Creator(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-class Match(Base):
-    __tablename__ = "matches"
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    brand_id = Column(String)
-    creator_id = Column(String)
-    creator_name = Column(String)
-    match_score = Column(Integer)
-    niche_match = Column(String)
-    audience_match = Column(String)
-    budget_fit = Column(String)
-    platform_match = Column(String)
-    engagement_metric = Column(String)
-    key_strengths = Column(Text)
-    concerns = Column(Text)
-    overall_reasoning = Column(Text)
-    approval_status = Column(String, default="pending")
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-
 Base.metadata.create_all(bind=engine)
 
 # ============ PYDANTIC MODELS ============
@@ -180,14 +161,14 @@ class CampaignAnalysisRequest(BaseModel):
 async_client = AsyncAnthropic()
 
 
-async def call_claude(system_prompt: str, user_message: str) -> str:
+async def call_claude(system_prompt: str, user_message: str, model: Optional[str] = None) -> str:
     """
     Call Claude and return only the text output.
     - Skips thinking blocks (adaptive thinking is on by default)
     - Fails loudly if output was cut off by max_tokens
     """
     response = await async_client.messages.create(
-        model=EMAIL_MODEL,
+        model=model or EMAIL_MODEL,
         max_tokens=MAX_TOKENS,
         system=system_prompt,
         messages=[{"role": "user", "content": user_message}]
@@ -848,6 +829,446 @@ async def upsert_campaign_from_brief(req: CampaignFromBriefRequest):
         raise HTTPException(status_code=500, detail=f"Error saving campaign: {str(e)}")
 
 
+# ============ FRED: MATCHING AGENT ============
+FRED_MODEL = "claude-sonnet-5"
+FRED_VERSION = "fred-v1"
+
+
+class FredMatchRequest(BaseModel):
+    campaign_id: str
+
+
+FRED_SYSTEM_PROMPT = """You are Fred, the Matching Agent at an influencer marketing agency in India.
+You score how well each candidate creator fits a brand's campaign.
+
+Score each creator 0-100 as the sum of four parts, each 0-25:
+- niche_fit: does their content naturally fit this product and category?
+- audience_fit: does their audience (location, city tier, language, age, gender) match the target?
+- engagement_quality: judge engagement RELATIVE to follower tier. Smaller accounts naturally have
+  higher engagement rates, so 4% at 5M followers can be stronger than 9% at 20K.
+- value_for_money: expected impact for the price. Use their rate if known, otherwise your estimate.
+
+Also return:
+- restriction_conflict: true if the creator's stated restrictions rule out this brand or product
+- availability_conflict: true if their stated availability clearly misses the campaign timeline
+- red_flags: suspicious numbers (very few followers, engagement implausible for the size), or null
+- estimated_rate: ONLY when their rate is unknown, a fair INR fee for this work in the Indian market
+  given their tier, niche and platform. Otherwise null.
+- anon_summary: one sentence on why they fit, written for the brand. Never include a name, handle,
+  or anything that identifies the creator.
+
+Return ONLY a JSON array with one object per creator, no other text:
+[
+  {
+    "creator_id": "CREATOR_001",
+    "match_score": 82,
+    "score_breakdown": {"niche_fit": 22, "audience_fit": 20, "engagement_quality": 20, "value_for_money": 20},
+    "reasoning": "Why this creator fits or doesn't, 1-2 sentences",
+    "concerns": null,
+    "red_flags": null,
+    "restriction_conflict": false,
+    "availability_conflict": false,
+    "estimated_rate": null,
+    "anon_summary": "Pune-based fitness educator with a highly engaged local audience"
+  }
+]
+"""
+
+
+def _words(value) -> set:
+    return {w for w in re.findall(r"[a-z]+", str(value or "").lower()) if len(w) > 2}
+
+
+def _platform_ok(creator_platform, campaign_platform) -> bool:
+    if not campaign_platform or not creator_platform:
+        return True
+    return str(creator_platform).strip().lower() in str(campaign_platform).lower()
+
+
+def _location_ok(creator_location, requirement) -> bool:
+    if not requirement or not creator_location:
+        return True   # unknown location: let Fred judge it
+    return bool(_words(creator_location) & _words(requirement))
+
+
+def _format_followers(n) -> str:
+    if not n:
+        return "unknown"
+    n = int(n)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{round(n / 1_000)}K"
+    return str(n)
+
+
+def _anonymize(text_value, creator) -> str:
+    """Strip a creator's name and handle from brand-facing text"""
+    result = str(text_value or "")
+    for token in (creator.get("creator_name"), creator.get("handle"),
+                  str(creator.get("handle") or "").lstrip("@")):
+        if token and len(str(token)) > 1:
+            result = re.sub(re.escape(str(token)), "this creator", result, flags=re.IGNORECASE)
+    return result
+
+
+def parse_json_array(response_text: str) -> list:
+    response_text = clean_json_text(response_text)
+    try:
+        data = json.loads(response_text)
+    except json.JSONDecodeError:
+        start, end = response_text.find("["), response_text.rfind("]")
+        data = json.loads(response_text[start:end + 1])
+    return data if isinstance(data, list) else []
+
+
+@app.post("/agent/fred/match")
+async def fred_match(request: FredMatchRequest):
+    """
+    FRED: Match creators to a campaign.
+    1. Budget math   2. Hard filters (Python)   3. Claude scores up to N survivors
+    4. Shortlist (per collab: top N; campaign pool: best mix within budget)
+    Saves the shortlist to matches and returns internal + anonymized views.
+    """
+    try:
+        s = load_settings()
+        shortlist_size = int(s.get("shortlist_size", 5))
+        max_candidates = int(s.get("fred_max_candidates", 15))
+        include_unconfirmed = s.get("fred_include_unconfirmed", 1) >= 1
+
+        # ---------- Load campaign, creators, exclusivity blocks ----------
+        with engine.connect() as conn:
+            campaign = conn.execute(text("""
+                SELECT c.*, b.brand_name, b.industry, b.basic_info AS brand_info
+                FROM campaigns c JOIN brands b ON b.brand_id = c.brand_id
+                WHERE c.campaign_id = :cid
+            """), {"cid": request.campaign_id}).mappings().first()
+            if not campaign:
+                raise HTTPException(status_code=404, detail="Campaign not found")
+            campaign = dict(campaign)
+
+            creators = [dict(r) for r in conn.execute(text("""
+                SELECT creator_id, creator_name, platform, handle, basic_info, follower_count,
+                       engagement_rate, comments, min_budget, restrictions, availability,
+                       best_format, niche, location, audience_type, languages
+                FROM creators
+                WHERE COALESCE(unsubscribed, FALSE) = FALSE
+                  AND COALESCE(response_intent, '') NOT IN ('not_interested', 'unsubscribe')
+                  AND creator_id NOT IN (
+                      SELECT creator_id FROM matches
+                      WHERE campaign_id = :cid AND approval_status <> 'pending'
+                  )
+            """), {"cid": request.campaign_id}).mappings().all()]
+
+            # Creators who accepted a competing brand's campaign inside its exclusivity window
+            blocked = {row[0] for row in conn.execute(text("""
+                SELECT DISTINCT o.creator_id
+                FROM offers o
+                JOIN campaigns c ON c.campaign_id = o.campaign_id
+                JOIN brands b ON b.brand_id = c.brand_id
+                WHERE o.status = 'accepted'
+                  AND c.brand_id <> :brand_id
+                  AND COALESCE(c.exclusivity_days, 0) > 0
+                  AND c.updated_at > NOW() - make_interval(days => c.exclusivity_days)
+                  AND :industry <> ''
+                  AND LOWER(COALESCE(b.industry, '')) = LOWER(:industry)
+            """), {"brand_id": campaign["brand_id"],
+                   "industry": campaign.get("industry") or ""}).fetchall()}
+
+        # ---------- Step 1: budget math ----------
+        margin_target = float(campaign["margin_target"] or s.get("margin_target", 0.30))
+        margin_floor = float(campaign["margin_floor"] or s.get("margin_floor", 0.20))
+        pricing_model = campaign["pricing_model"] or "campaign_pool"
+
+        if pricing_model == "per_collab":
+            rate = campaign["rate_per_collab"]
+            if not rate:
+                raise HTTPException(status_code=400, detail="Campaign has no rate_per_collab yet")
+            slots = campaign["slots"] or 1
+            brand_price = rate * slots
+            cap_target = int(rate * (1 - margin_target))    # max payout per creator at target margin
+            cap_stretch = int(rate * (1 - margin_floor))    # max payout per creator at margin floor
+        else:
+            total = campaign["total_budget"]
+            if not total:
+                raise HTTPException(status_code=400, detail="Campaign has no total_budget yet")
+            rate, slots = None, None
+            brand_price = total
+            cap_target = int(total * (1 - margin_target))   # creator pool at target margin
+            cap_stretch = int(total * (1 - margin_floor))   # creator pool at margin floor
+
+        # ---------- Step 2: hard filters ----------
+        excluded = {"exclusivity": 0, "platform": 0, "location": 0, "over_budget": 0, "rate_unknown": 0}
+        survivors = []
+        for c in creators:
+            confirmed = c["min_budget"] is not None
+            if c["creator_id"] in blocked:
+                excluded["exclusivity"] += 1
+            elif not _platform_ok(c["platform"], campaign["platform"]):
+                excluded["platform"] += 1
+            elif not _location_ok(c["location"], campaign["location_requirement"]):
+                excluded["location"] += 1
+            elif confirmed and c["min_budget"] > cap_stretch:
+                excluded["over_budget"] += 1
+            elif not confirmed and not include_unconfirmed:
+                excluded["rate_unknown"] += 1
+            else:
+                survivors.append(c)
+
+        # Cheap pre-ranking so Claude only sees the most promising candidates
+        target_words = _words(campaign["niche"]) | _words(campaign["target_audience"]) | _words(campaign.get("industry"))
+
+        def prescore(c):
+            overlap = len(target_words & (_words(c["niche"]) | _words(c["basic_info"]) | _words(c["comments"])))
+            return overlap * 3 + (2 if c["min_budget"] is not None else 0) + min(float(c["engagement_rate"] or 0), 10) / 2
+
+        candidates = sorted(survivors, key=prescore, reverse=True)[:max_candidates]
+
+        budget_math = {
+            "pricing_model": pricing_model,
+            "brand_price": brand_price,
+            "rate_per_collab": rate,
+            "slots": slots,
+            "margin_target": margin_target,
+            "margin_floor": margin_floor,
+            "creator_budget_at_target": cap_target,
+            "creator_budget_at_floor": cap_stretch,
+        }
+
+        if not candidates:
+            return {
+                "status": "no_candidates",
+                "campaign_id": request.campaign_id,
+                "needs_recruiting": True,
+                "message": "No creators passed the filters. Recruit in this niche or relax the brief.",
+                "filters_excluded": excluded,
+                "budget_math": budget_math,
+                "internal_view": [],
+                "anonymized_view": []
+            }
+
+        # ---------- Step 3: Claude scores the candidates ----------
+        def val(v):
+            return v if v not in (None, "") else "unknown"
+
+        pricing_line = (f"Per collab: INR {rate} per creator, {slots} creator(s) wanted"
+                        if pricing_model == "per_collab" else f"Total campaign budget: INR {brand_price}")
+        campaign_text = f"""CAMPAIGN
+Brand: {campaign['brand_name']} (industry: {val(campaign.get('industry'))})
+About the brand: {val(campaign.get('brand_info'))}
+{pricing_line}
+Platform: {val(campaign['platform'])}
+Niche wanted: {val(campaign['niche'])}
+Target audience: {val(campaign['target_audience'])}
+Location requirement: {val(campaign['location_requirement'])}
+Deliverables: {val(campaign['deliverables'])}
+Timeline: {val(campaign['timeline_days'])} days
+Other requirements: {val(campaign['requirements'])}"""
+
+        candidates_text = "\n\n".join(
+            f"""Creator {c['creator_id']}:
+- Platform: {val(c['platform'])}
+- Followers: {val(c['follower_count'])}
+- Engagement rate: {val(c['engagement_rate'])}%
+- Niche: {val(c['niche'])}
+- About: {val(c['basic_info'])}
+- Notes: {val(c['comments'])}
+- Location: {val(c['location'])}
+- Audience: {val(c['audience_type'])}
+- Languages: {val(c['languages'])}
+- Rate: {('INR ' + str(c['min_budget']) + ' minimum') if c['min_budget'] is not None else 'unknown'}
+- Restrictions: {val(c['restrictions'])}
+- Availability: {val(c['availability'])}
+- Best format: {val(c['best_format'])}"""
+            for c in candidates
+        )
+
+        user_message = f"""{campaign_text}
+
+CANDIDATES ({len(candidates)}):
+
+{candidates_text}
+
+Score ALL {len(candidates)} candidates. Return ONLY the JSON array."""
+
+        scores = parse_json_array(await call_claude(FRED_SYSTEM_PROMPT, user_message, model=FRED_MODEL))
+
+        # ---------- Merge scores, drop conflicts, price each creator ----------
+        by_id = {c["creator_id"]: c for c in candidates}
+        conflicts, scored = [], []
+        for sc in scores:
+            c = by_id.get(sc.get("creator_id"))
+            if not c:
+                continue
+            if sc.get("restriction_conflict") or sc.get("availability_conflict"):
+                conflicts.append({"creator_id": c["creator_id"], "reason": sc.get("reasoning")})
+                continue
+
+            confirmed = c["min_budget"] is not None
+            estimated = to_int_or_none(sc.get("estimated_rate"))
+            cost = c["min_budget"] if confirmed else estimated
+            concerns = sc.get("concerns")
+
+            if pricing_model == "per_collab":
+                effective = cost if cost is not None else cap_target
+                if effective <= cap_target:
+                    is_stretch, payout = False, effective
+                elif effective <= cap_stretch:
+                    is_stretch, payout = True, effective
+                else:
+                    # Only possible for unconfirmed creators: estimate is above budget
+                    is_stretch, payout = True, cap_stretch
+                    concerns = ((concerns + "; ") if concerns else "") + "Estimated rate is above budget"
+            else:
+                is_stretch = False
+                payout = cost if cost is not None else cap_target // max(shortlist_size, 1)
+
+            scored.append({
+                **c,
+                "match_score": to_int_or_none(sc.get("match_score")) or 0,
+                "score_breakdown": sc.get("score_breakdown") or {},
+                "reasoning": sc.get("reasoning"),
+                "concerns": concerns,
+                "red_flags": sc.get("red_flags"),
+                "anon_summary": sc.get("anon_summary"),
+                "rate_confirmed": confirmed,
+                "estimated_rate": None if confirmed else estimated,
+                "is_stretch": is_stretch,
+                "suggested_payout": int(payout),
+            })
+
+        # ---------- Step 4: build the shortlist ----------
+        if pricing_model == "per_collab":
+            ranked = (sorted([x for x in scored if not x["is_stretch"]], key=lambda x: -x["match_score"])
+                      + sorted([x for x in scored if x["is_stretch"]], key=lambda x: -x["match_score"]))
+            shortlist = ranked[:max(shortlist_size, slots)]
+            recommended = shortlist[:slots]
+            creator_cost = sum(x["suggested_payout"] for x in recommended)
+            projected_price = rate * len(recommended)
+        else:
+            # Best-fit mix within the pool at target margin, then stretch picks up to the floor
+            shortlist, spent = [], 0
+            remaining = sorted(scored, key=lambda x: -x["match_score"])
+            for x in list(remaining):
+                if len(shortlist) >= shortlist_size:
+                    break
+                if spent + x["suggested_payout"] <= cap_target:
+                    shortlist.append(x)
+                    spent += x["suggested_payout"]
+                    remaining.remove(x)
+            for x in list(remaining):
+                if len(shortlist) >= shortlist_size:
+                    break
+                if spent + x["suggested_payout"] <= cap_stretch:
+                    x["is_stretch"] = True
+                    shortlist.append(x)
+                    spent += x["suggested_payout"]
+                    remaining.remove(x)
+            creator_cost = spent
+            projected_price = brand_price
+
+        projected_margin = projected_price - creator_cost
+        budget_math.update({
+            "projected_brand_price": projected_price,
+            "projected_creator_cost": creator_cost,
+            "projected_margin": projected_margin,
+            "projected_margin_pct": round(projected_margin / projected_price, 3) if projected_price else None,
+            "below_margin_floor": bool(projected_price and projected_margin / projected_price < margin_floor),
+        })
+
+        # ---------- Save shortlist to matches ----------
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM matches WHERE campaign_id = :cid AND approval_status = 'pending'"),
+                         {"cid": request.campaign_id})
+            for rank, x in enumerate(shortlist, start=1):
+                x["rank"] = rank
+                row = conn.execute(text("""
+                    INSERT INTO matches (campaign_id, creator_id, rank, match_score, score_breakdown,
+                        reasoning, concerns, red_flags, is_stretch, suggested_payout,
+                        creator_min_budget_at_match, fred_model, fred_version)
+                    VALUES (:campaign_id, :creator_id, :rank, :match_score, CAST(:score_breakdown AS JSONB),
+                        :reasoning, :concerns, :red_flags, :is_stretch, :suggested_payout,
+                        :min_budget, :fred_model, :fred_version)
+                    ON CONFLICT (campaign_id, creator_id) DO NOTHING
+                    RETURNING id
+                """), {
+                    "campaign_id": request.campaign_id,
+                    "creator_id": x["creator_id"],
+                    "rank": rank,
+                    "match_score": x["match_score"],
+                    "score_breakdown": json.dumps(x["score_breakdown"]),
+                    "reasoning": x["reasoning"],
+                    "concerns": x["concerns"],
+                    "red_flags": x["red_flags"],
+                    "is_stretch": x["is_stretch"],
+                    "suggested_payout": x["suggested_payout"],
+                    "min_budget": x["min_budget"],
+                    "fred_model": FRED_MODEL,
+                    "fred_version": FRED_VERSION,
+                }).first()
+                x["match_id"] = row[0] if row else None
+
+            if shortlist:
+                conn.execute(text("""
+                    UPDATE campaigns SET status = 'awaiting_approval'
+                    WHERE campaign_id = :cid AND status IN ('brief_received', 'matching')
+                """), {"cid": request.campaign_id})
+
+        # ---------- Two views of the same shortlist ----------
+        internal_view = [{
+            "rank": x["rank"],
+            "match_id": x["match_id"],
+            "creator_id": x["creator_id"],
+            "creator_name": x["creator_name"],
+            "handle": x["handle"],
+            "platform": x["platform"],
+            "followers": x["follower_count"],
+            "engagement_rate": x["engagement_rate"],
+            "niche": x["niche"],
+            "location": x["location"],
+            "match_score": x["match_score"],
+            "score_breakdown": x["score_breakdown"],
+            "reasoning": x["reasoning"],
+            "concerns": x["concerns"],
+            "red_flags": x["red_flags"],
+            "rate_confirmed": x["rate_confirmed"],
+            "creator_min_budget": x["min_budget"],
+            "estimated_rate": x["estimated_rate"],
+            "suggested_payout": x["suggested_payout"],
+            "is_stretch": x["is_stretch"],
+        } for x in shortlist]
+
+        anonymized_view = [{
+            "label": f"Creator {chr(65 + i)}",
+            "platform": x["platform"],
+            "followers": _format_followers(x["follower_count"]),
+            "engagement_rate": x["engagement_rate"],
+            "niche": x["niche"],
+            "location": x["location"],
+            "audience": x["audience_type"],
+            "why_this_creator": _anonymize(x["anon_summary"], x),
+        } for i, x in enumerate(shortlist)]
+
+        return {
+            "status": "success",
+            "campaign_id": request.campaign_id,
+            "brand_name": campaign["brand_name"],
+            "needs_recruiting": len(shortlist) < min(3, max(shortlist_size, slots or 1)),
+            "candidates_considered": len(creators),
+            "candidates_scored": len(candidates),
+            "filters_excluded": excluded,
+            "excluded_by_fred": conflicts,
+            "budget_math": budget_math,
+            "internal_view": internal_view,
+            "anonymized_view": anonymized_view,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Fred matching error: {str(e)}")
+
+
 # ============ BRANDS CRUD ============
 @app.post("/brands")
 async def create_brand(brand: dict):
@@ -907,31 +1328,6 @@ async def get_creators():
     db = SessionLocal()
     try:
         return db.query(Creator).all()
-    finally:
-        db.close()
-
-
-# ============ MATCHES CRUD ============
-@app.post("/matches")
-async def create_match(match: dict):
-    """Create a new match"""
-    db = SessionLocal()
-    try:
-        db_match = Match(**match, id=str(uuid.uuid4()))
-        db.add(db_match)
-        db.commit()
-        db.refresh(db_match)
-        return db_match
-    finally:
-        db.close()
-
-
-@app.get("/matches")
-async def get_matches():
-    """Get all matches"""
-    db = SessionLocal()
-    try:
-        return db.query(Match).all()
     finally:
         db.close()
 
