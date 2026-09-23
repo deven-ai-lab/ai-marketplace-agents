@@ -5,6 +5,7 @@ import json
 import asyncio
 from datetime import datetime
 from typing import Optional, List, Callable
+from types import SimpleNamespace
 from fastapi import FastAPI, HTTPException
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
@@ -199,7 +200,7 @@ def clean_json_text(response_text: str) -> str:
     return response_text.strip()
 
 
-def parse_pitches(response_text: str, id_key: str) -> list:
+def parse_pitches(response_text: str, id_key: str, text_key: str = "pitch_email") -> list:
     """Parse Claude's JSON array, with repair fallbacks"""
     response_text = clean_json_text(response_text)
 
@@ -211,8 +212,8 @@ def parse_pitches(response_text: str, id_key: str) -> list:
     # Fallback 1: fix unescaped quotes inside pitch_email
     repaired = response_text.replace('\\"', '__ESCAPED_QUOTE__')
     repaired = re.sub(
-        r'"pitch_email":\s*"([^"]*)"',
-        lambda m: f'"pitch_email": "{m.group(1).replace(chr(34), chr(92) + chr(34))}"',
+        r'"' + text_key + r'":\s*"([^"]*)"',
+        lambda m: f'"{text_key}": "{m.group(1).replace(chr(34), chr(92) + chr(34))}"',
         repaired
     )
     repaired = repaired.replace('__ESCAPED_QUOTE__', '\\"')
@@ -223,7 +224,7 @@ def parse_pitches(response_text: str, id_key: str) -> list:
 
     # Fallback 2: extract individual objects
     pitches = []
-    pattern = r'\{[^}]*?"' + id_key + r'"[^}]*?"pitch_email"[^}]*?\}'
+    pattern = r'\{[^}]*?"' + id_key + r'"[^}]*?"' + text_key + r'"[^}]*?\}'
     for match in re.findall(pattern, response_text, re.DOTALL):
         try:
             pitches.append(json.loads(match))
@@ -237,7 +238,9 @@ async def generate_pitches_parallel(
     id_key: str,
     format_item: Callable,
     system_prompt: str,
-    label: str
+    label: str,
+    text_key: str = "pitch_email",
+    task: str = "pitch emails"
 ) -> dict:
     """
     Shared engine for Steve and Aditya:
@@ -250,14 +253,14 @@ async def generate_pitches_parallel(
 
     async def run_batch(batch: list) -> list:
         items_text = "\n\n".join(format_item(i, item) for i, item in enumerate(batch))
-        user_message = f"""Generate pitch emails for ALL {len(batch)} {label} provided below. Return exactly {len(batch)} entries in the JSON array - one for each.
+        user_message = f"""Write {task} for ALL {len(batch)} {label} provided below. Return exactly {len(batch)} entries in the JSON array - one for each.
 
 {items_text}
 
 Do not skip anyone. Return ONLY the JSON array, no other text."""
         async with semaphore:
             try:
-                return parse_pitches(await call_claude(system_prompt, user_message), id_key)
+                return parse_pitches(await call_claude(system_prompt, user_message), id_key, text_key)
             except Exception as e:
                 print(f"[{label}] batch failed ({[getattr(x, id_key) for x in batch]}): {e}")
                 return []
@@ -270,8 +273,8 @@ Do not skip anyone. Return ONLY the JSON array, no other text."""
             for pitch in batch_pitches:
                 pid = pitch.get(id_key)
                 # Keep only IDs we actually sent, first valid pitch wins
-                if pid in valid_ids and pid not in pitch_map and pitch.get("pitch_email"):
-                    pitch_map[pid] = pitch["pitch_email"]
+                if pid in valid_ids and pid not in pitch_map and pitch.get(text_key):
+                    pitch_map[pid] = pitch[text_key]
 
     # Pass 1: all batches in parallel
     batches = [items[i:i + BATCH_SIZE] for i in range(0, len(items), BATCH_SIZE)]
@@ -1276,6 +1279,291 @@ Score ALL {len(candidates)} candidates. Return ONLY the JSON array."""
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Fred matching error: {str(e)}")
+
+
+# ============ FOLLOW-UPS (STEVE + ADITYA) ============
+FOLLOWUP_RULES = """
+Rules:
+- 2-4 short sentences, under 70 words. No subject line (it is sent as a reply in the same thread).
+- Follow-up 1: a friendly nudge with ONE new, specific reason to reply that fits them.
+  Make replying effortless, e.g. "Just reply with ..." and the one or two details you need.
+- Follow-up 2 (final): brief and polite. Say this is your last note and leave the door open.
+- Never guilt-trip. Never write "just following up", "circling back" or "bumping this".
+- Do not repeat the original pitch.
+- Never invent facts, client names, past results or numbers.
+
+Return ONLY a JSON array, no other text:
+[{"contact_id": "ID_001", "followup_email": "Hi ...,\\n\\n...\\n\\n<sign-off>"}]
+"""
+
+STEVE_FOLLOWUP_PROMPT = """You are Steve, Brand Manager at an influencer marketing agency in India.
+These brands have not replied to your partnership pitch. Write a short follow-up email for each.
+Sign off exactly as:
+Steve
+Brand Partnerships
+""" + FOLLOWUP_RULES
+
+ADITYA_FOLLOWUP_PROMPT = """You are Aditya, Creator Manager at an influencer marketing agency in India.
+These creators have not replied to your collaboration pitch. Write a short follow-up email for each.
+The easiest reply to ask for is their rate per collaboration and the kind of brands they like.
+Sign off exactly as:
+Aditya
+Creator Manager
+""" + FOLLOWUP_RULES
+
+FOLLOWUP_SOURCES = {
+    "brand": {
+        "table": "brands", "id_col": "brand_id", "name_col": "brand_name",
+        "extra": "industry, basic_info, pitch_email AS pitch_text",
+        "prompt": STEVE_FOLLOWUP_PROMPT, "label": "brands",
+    },
+    "creator": {
+        "table": "creators", "id_col": "creator_id", "name_col": "creator_name",
+        "extra": "platform, niche, basic_info, CONCAT_WS(E'\\n\\n', pitch_subject, pitch_body) AS pitch_text",
+        "prompt": ADITYA_FOLLOWUP_PROMPT, "label": "creators",
+    },
+}
+
+OPEN_CONTACT_FILTER = """
+    COALESCE(response_received, FALSE) = FALSE
+    AND COALESCE(unsubscribed, FALSE) = FALSE
+    AND COALESCE(status, '') NOT IN ('unsubscribed', 'no_response', 'responded')
+"""
+
+
+def _format_followup_item(i: int, item) -> str:
+    details = "\n".join(f"- {k}: {v}" for k, v in item.details.items() if v not in (None, ""))
+    excerpt = (item.pitch_text or "")[:400]
+    return f"""Contact #{i + 1}:
+- ID: {item.contact_id}
+- Name: {item.contact_name}
+{details}
+- Follow-up number: {item.followup_number} of {item.max_followups}
+- Our original pitch (excerpt): {excerpt}"""
+
+
+@app.post("/followups/prepare")
+async def prepare_followups():
+    """
+    Daily follow-up run:
+    1. Close out contacts that got every follow-up and still never replied (status = no_response)
+    2. Find contacts due for follow-up 1 or 2
+    3. Steve / Aditya write the follow-ups (parallel batches)
+    Returns a list ready for N8N to send as replies in the original Gmail threads.
+    """
+    try:
+        s = load_settings()
+        f1 = int(s.get("followup_1_days", 3))
+        f2 = int(s.get("followup_2_days", 7))
+        max_f = int(s.get("max_followups", 2))
+        close_days = int(s.get("followup_close_days", 4))
+        limit = int(s.get("followup_daily_limit", 100))
+
+        closed_out, due = {}, {}
+        with engine.begin() as conn:
+            for ctype, src in FOLLOWUP_SOURCES.items():
+                # 1. Close out contacts who ignored every follow-up
+                closed_out[ctype] = conn.execute(text(f"""
+                    UPDATE {src['table']} SET status = 'no_response'
+                    WHERE {OPEN_CONTACT_FILTER}
+                      AND COALESCE(followup_count, 0) >= :max_f
+                      AND last_followup_at <= NOW() - make_interval(days => :close_days)
+                """), {"max_f": max_f, "close_days": close_days}).rowcount
+
+                # 2. Contacts due for their next follow-up
+                rows = conn.execute(text(f"""
+                    SELECT {src['id_col']} AS contact_id, {src['name_col']} AS contact_name,
+                           email, gmail_thread_id, gmail_message_id,
+                           COALESCE(followup_count, 0) AS followup_count, {src['extra']}
+                    FROM {src['table']}
+                    WHERE {OPEN_CONTACT_FILTER}
+                      AND gmail_message_id IS NOT NULL
+                      AND COALESCE(email, '') <> ''
+                      AND COALESCE(followup_count, 0) < :max_f
+                      AND (
+                        (COALESCE(followup_count, 0) = 0 AND email_sent_date <= NOW() - make_interval(days => :f1))
+                        OR (COALESCE(followup_count, 0) >= 1 AND email_sent_date <= NOW() - make_interval(days => :f2))
+                      )
+                    ORDER BY email_sent_date ASC
+                    LIMIT :lim
+                """), {"max_f": max_f, "f1": f1, "f2": f2, "lim": limit}).mappings().all()
+                due[ctype] = [dict(r) for r in rows]
+
+        # 3. Write follow-ups: Steve for brands, Aditya for creators, both in parallel
+        async def write(ctype: str) -> dict:
+            rows = due[ctype]
+            if not rows:
+                return {}
+            items = []
+            for r in rows:
+                details = ({"Industry": r.get("industry"), "About": r.get("basic_info")} if ctype == "brand"
+                           else {"Platform": r.get("platform"), "Niche": r.get("niche"), "About": r.get("basic_info")})
+                items.append(SimpleNamespace(
+                    contact_id=r["contact_id"], contact_name=r["contact_name"],
+                    details=details, pitch_text=r.get("pitch_text"),
+                    followup_number=r["followup_count"] + 1, max_followups=max_f,
+                ))
+            src = FOLLOWUP_SOURCES[ctype]
+            return await generate_pitches_parallel(
+                items, "contact_id", _format_followup_item, src["prompt"], src["label"],
+                text_key="followup_email", task="follow-up emails"
+            )
+
+        written_brand, written_creator = await asyncio.gather(write("brand"), write("creator"))
+        written = {"brand": written_brand, "creator": written_creator}
+
+        followups, failed = [], []
+        for ctype, rows in due.items():
+            for r in rows:
+                body = written[ctype].get(r["contact_id"])
+                if not body:
+                    failed.append({"contact_type": ctype, "contact_id": r["contact_id"]})
+                    continue
+                followups.append({
+                    "contact_type": ctype,
+                    "contact_id": r["contact_id"],
+                    "contact_name": r["contact_name"],
+                    "email": r["email"],
+                    "gmail_thread_id": r["gmail_thread_id"],
+                    "gmail_message_id": r["gmail_message_id"],   # original pitch: reply to this
+                    "followup_number": r["followup_count"] + 1,
+                    "body": body,
+                })
+
+        return {
+            "status": "success",
+            "closed_out": closed_out,
+            "count": len(followups),
+            "failed": failed,
+            "followups": followups,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error preparing follow-ups: {str(e)}")
+
+
+class FollowupMarkRequest(BaseModel):
+    contact_type: str
+    contact_id: str
+    followup_number: int
+    gmail_message_id: Optional[str] = None   # ID of the follow-up we just sent
+    gmail_thread_id: Optional[str] = None
+    body: Optional[str] = None
+
+
+@app.post("/followups/mark")
+async def mark_followup(req: FollowupMarkRequest):
+    """Record a sent follow-up on the contact and log it in conversations"""
+    try:
+        src = FOLLOWUP_SOURCES.get(req.contact_type)
+        if not src:
+            raise HTTPException(status_code=400, detail="contact_type must be 'brand' or 'creator'")
+
+        with engine.begin() as conn:
+            updated = conn.execute(text(f"""
+                UPDATE {src['table']}
+                SET followup_count = :n, last_followup_at = NOW()
+                WHERE {src['id_col']} = :cid
+            """), {"n": req.followup_number, "cid": req.contact_id}).rowcount
+
+            conn.execute(text("""
+                INSERT INTO conversations (contact_type, contact_id, gmail_thread_id, gmail_message_id,
+                                           direction, subject, body, intent)
+                VALUES (:ctype, :cid, :thread, :msg, 'outbound', :subject, :body, 'followup')
+                ON CONFLICT (gmail_message_id) DO NOTHING
+            """), {
+                "ctype": req.contact_type, "cid": req.contact_id,
+                "thread": req.gmail_thread_id, "msg": req.gmail_message_id,
+                "subject": f"Follow-up {req.followup_number}", "body": req.body,
+            })
+
+        return {"status": "success", "updated": updated}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error marking follow-up: {str(e)}")
+
+
+# ============ DAILY DIGEST ============
+@app.post("/digest/daily")
+async def daily_digest():
+    """Last 24h activity, 7-day reply rates and anything waiting on Deven, as a Slack message"""
+    try:
+        s = load_settings()
+        approval_days = int(s.get("approval_stale_days", 1))
+        brief_days = int(s.get("brief_stale_days", 3))
+
+        with engine.connect() as conn:
+            def count(sql: str) -> int:
+                return conn.execute(text(sql)).scalar() or 0
+
+            pitched_b = count("SELECT COUNT(*) FROM brands WHERE email_sent_date >= NOW() - INTERVAL '1 day'")
+            pitched_c = count("SELECT COUNT(*) FROM creators WHERE email_sent_date >= NOW() - INTERVAL '1 day'")
+            replies_b = count("""SELECT COUNT(*) FROM conversations WHERE direction = 'inbound' AND contact_type = 'brand'
+                                 AND COALESCE(intent, '') <> 'auto_reply' AND created_at >= NOW() - INTERVAL '1 day'""")
+            replies_c = count("""SELECT COUNT(*) FROM conversations WHERE direction = 'inbound' AND contact_type = 'creator'
+                                 AND COALESCE(intent, '') <> 'auto_reply' AND created_at >= NOW() - INTERVAL '1 day'""")
+            followups = count("""SELECT (SELECT COUNT(*) FROM brands WHERE last_followup_at >= NOW() - INTERVAL '1 day')
+                                      + (SELECT COUNT(*) FROM creators WHERE last_followup_at >= NOW() - INTERVAL '1 day')""")
+
+            # 7-day reply rate: contacts pitched 1-8 days ago, so each had at least a day to reply
+            def rate(table: str):
+                replied, total = conn.execute(text(f"""
+                    SELECT COUNT(*) FILTER (WHERE response_received), COUNT(*) FROM {table}
+                    WHERE email_sent_date BETWEEN NOW() - INTERVAL '8 days' AND NOW() - INTERVAL '1 day'
+                """)).first()
+                return replied or 0, total or 0
+
+            rate_b, rate_c = rate("brands"), rate("creators")
+
+            waiting_approval = conn.execute(text("""
+                SELECT c.campaign_id, b.brand_name,
+                       EXTRACT(DAY FROM NOW() - c.updated_at)::INT AS days
+                FROM campaigns c JOIN brands b ON b.brand_id = c.brand_id
+                WHERE c.status = 'awaiting_approval'
+                  AND c.updated_at <= NOW() - make_interval(days => :d)
+                ORDER BY c.updated_at
+            """), {"d": approval_days}).mappings().all()
+
+            stalled_briefs = conn.execute(text("""
+                SELECT c.campaign_id, b.brand_name,
+                       EXTRACT(DAY FROM NOW() - c.created_at)::INT AS days
+                FROM campaigns c JOIN brands b ON b.brand_id = c.brand_id
+                WHERE c.status = 'brief_received'
+                  AND c.created_at <= NOW() - make_interval(days => :d)
+                ORDER BY c.created_at
+            """), {"d": brief_days}).mappings().all()
+
+        def pct(replied, total):
+            return f"{(replied / total * 100):.1f}% ({replied}/{total})" if total else "no data yet"
+
+        lines = [
+            "📊 *Daily digest*",
+            f"*Last 24h:* {pitched_b} brands and {pitched_c} creators pitched · "
+            f"{replies_b + replies_c} replies ({replies_b} brands, {replies_c} creators) · {followups} follow-ups sent",
+            f"*7-day reply rate:* brands {pct(*rate_b)} · creators {pct(*rate_c)}",
+        ]
+        if waiting_approval:
+            lines.append(f"\n⏳ *Waiting on you ({len(waiting_approval)}):* shortlists pending approval")
+            lines += [f"• {r['brand_name']} · `{r['campaign_id']}` · {r['days']} day(s)" for r in waiting_approval[:10]]
+        if stalled_briefs:
+            lines.append(f"\n🟡 *Stalled briefs ({len(stalled_briefs)}):* no budget yet, or below minimum and undecided")
+            lines += [f"• {r['brand_name']} · `{r['campaign_id']}` · {r['days']} day(s)" for r in stalled_briefs[:10]]
+        if not waiting_approval and not stalled_briefs:
+            lines.append("\n✅ Nothing waiting on you.")
+
+        return {
+            "status": "success",
+            "slack_text": "\n".join(lines),
+            "stats": {
+                "pitched_brands": pitched_b, "pitched_creators": pitched_c,
+                "replies_brands": replies_b, "replies_creators": replies_c,
+                "followups_sent": followups,
+                "reply_rate_brands": rate_b, "reply_rate_creators": rate_c,
+                "waiting_approval": len(waiting_approval), "stalled_briefs": len(stalled_briefs),
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error building digest: {str(e)}")
 
 
 # ============ BRANDS CRUD ============
