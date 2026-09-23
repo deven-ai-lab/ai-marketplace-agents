@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime
 from typing import Optional, List, Callable
 from fastapi import FastAPI, HTTPException
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, text
 from sqlalchemy.ext.declarative import declarative_base
@@ -553,17 +554,29 @@ Return ONLY a valid JSON object. No preamble, no markdown.
 STEVE_PARSE_PROMPT = """You are Steve, Brand Manager Agent at an influencer marketing agency.
 You sent a pitch email to a brand and they replied. Read the reply and extract structured data.
 """ + REPLY_RULES + """
+PRICING MODEL:
+- "campaign_pool": the brand gives a TOTAL budget for the campaign (e.g. "2.5 lakh for the campaign")
+- "per_collab": the brand gives a rate PER creator or PER collaboration (e.g. "20k per collab", "15k per reel")
+- null: no budget mentioned
+Put a total budget in total_budget. Put a per-creator rate in rate_per_collab, and the number of creators wanted in slots.
+
 Format:
 {
   "intent": "interested",
   "summary": "One sentence summary of the reply for the founder",
   "questions": ["Any questions the brand asked"],
-  "budget": 200000,
+  "pricing_model": "campaign_pool",
+  "total_budget": 250000,
+  "rate_per_collab": null,
+  "slots": null,
   "budget_text": "exact budget wording from the email, or null",
   "platform": "Instagram, YouTube, etc. or null",
-  "timeline_days": 30,
   "niche": "creator niche they want, or null",
-  "requirements": "deliverables, audience, location or other requirements, or null",
+  "target_audience": "age, gender, city tier or other audience they want, or null",
+  "location_requirement": "cities or regions creators must be in, or null",
+  "deliverables": "e.g. 1 Reel + 2 Stories per creator, or null",
+  "timeline_days": 21,
+  "requirements": "any other requirements, or null",
   "notes": "anything else important, or null"
 }
 """
@@ -572,6 +585,8 @@ ADITYA_PARSE_PROMPT = """You are Aditya, Creator Manager Agent at an influencer 
 You sent a pitch email to a creator and they replied. Read the reply and extract structured data.
 """ + REPLY_RULES + """
 For min_budget, use the lowest amount the creator says they accept per collaboration.
+For niche, use the reply, or our original pitch if it clearly states their niche.
+For location, audience_type and languages, only use what the reply says.
 
 Format:
 {
@@ -583,6 +598,10 @@ Format:
   "restrictions": "categories or brands they will not promote, or null",
   "availability": "when they are available, or null",
   "best_format": "Reels, Stories, YouTube videos, etc. or null",
+  "niche": "e.g. fitness, beauty & skincare, tech reviews, or null",
+  "location": "city or region, or null",
+  "audience_type": "e.g. Gen Z, tier-2 cities, mostly female, or null",
+  "languages": "e.g. Hindi, Marathi, English, or null",
   "notes": "anything else important, or null"
 }
 """
@@ -605,11 +624,19 @@ def normalize_intent(parsed: dict) -> str:
     return intent if intent in VALID_INTENTS else "other"
 
 
+def clean_text(value):
+    """Return None for empty or 'null'-like strings"""
+    if value is None:
+        return None
+    value = str(value).strip()
+    return None if value == "" or value.lower() in ("null", "none", "n/a") else value
+
+
 @app.post("/agent/steve/parse-reply")
 async def steve_parse_reply(request: ParseReplyRequest):
     """
-    STEVE: Read a brand's reply and extract intent + campaign details.
-    Output fields map directly to the brands table.
+    STEVE: Read a brand's reply and extract intent + campaign brief.
+    campaign_brief can be sent straight to /campaigns/upsert-from-brief.
     """
     try:
         parsed = parse_json_object(
@@ -617,21 +644,43 @@ async def steve_parse_reply(request: ParseReplyRequest):
         )
         intent = normalize_intent(parsed)
 
+        pricing_model = clean_text(parsed.get("pricing_model"))
+        if pricing_model not in ("campaign_pool", "per_collab"):
+            pricing_model = None
+
+        campaign_brief = {
+            "pricing_model": pricing_model,
+            "total_budget": to_int_or_none(parsed.get("total_budget")),
+            "rate_per_collab": to_int_or_none(parsed.get("rate_per_collab")),
+            "slots": to_int_or_none(parsed.get("slots")),
+            "budget_text": clean_text(parsed.get("budget_text")),
+            "platform": clean_text(parsed.get("platform")),
+            "niche": clean_text(parsed.get("niche")),
+            "target_audience": clean_text(parsed.get("target_audience")),
+            "location_requirement": clean_text(parsed.get("location_requirement")),
+            "deliverables": clean_text(parsed.get("deliverables")),
+            "timeline_days": to_int_or_none(parsed.get("timeline_days")),
+            "requirements": clean_text(parsed.get("requirements")),
+        }
+
+        # A campaign is created only when the brand shares real brief details
+        detail_keys = ["total_budget", "rate_per_collab", "platform", "niche", "deliverables", "timeline_days"]
+        has_campaign_details = (
+            intent not in ("not_interested", "auto_reply", "unsubscribe")
+            and any(campaign_brief[k] is not None for k in detail_keys)
+        )
+
         return {
             "status": "success",
             "contact_type": "brand",
             "brand_id": request.contact_id,
             "intent": intent,
-            "is_real_response": intent not in ("auto_reply",),
+            "is_real_response": intent != "auto_reply",
             "summary": parsed.get("summary"),
             "questions": parsed.get("questions") or [],
-            "budget": to_int_or_none(parsed.get("budget")),
-            "budget_text": parsed.get("budget_text"),
-            "platform": parsed.get("platform"),
-            "timeline_days": to_int_or_none(parsed.get("timeline_days")),
-            "niche": parsed.get("niche"),
-            "requirements": parsed.get("requirements"),
-            "notes": parsed.get("notes"),
+            "has_campaign_details": has_campaign_details,
+            "campaign_brief": campaign_brief,
+            "notes": clean_text(parsed.get("notes")),
             "extracted_data": parsed
         }
     except Exception as e:
@@ -641,7 +690,7 @@ async def steve_parse_reply(request: ParseReplyRequest):
 @app.post("/agent/aditya/parse-reply")
 async def aditya_parse_reply(request: ParseReplyRequest):
     """
-    ADITYA: Read a creator's reply and extract intent + collaboration terms.
+    ADITYA: Read a creator's reply and extract intent, terms and profile details.
     Output fields map directly to the creators table.
     """
     try:
@@ -655,19 +704,148 @@ async def aditya_parse_reply(request: ParseReplyRequest):
             "contact_type": "creator",
             "creator_id": request.contact_id,
             "intent": intent,
-            "is_real_response": intent not in ("auto_reply",),
+            "is_real_response": intent != "auto_reply",
             "summary": parsed.get("summary"),
             "questions": parsed.get("questions") or [],
             "min_budget": to_int_or_none(parsed.get("min_budget")),
-            "budget_text": parsed.get("budget_text"),
-            "restrictions": parsed.get("restrictions"),
-            "availability": parsed.get("availability"),
-            "best_format": parsed.get("best_format"),
-            "notes": parsed.get("notes"),
+            "budget_text": clean_text(parsed.get("budget_text")),
+            "restrictions": clean_text(parsed.get("restrictions")),
+            "availability": clean_text(parsed.get("availability")),
+            "best_format": clean_text(parsed.get("best_format")),
+            "niche": clean_text(parsed.get("niche")),
+            "location": clean_text(parsed.get("location")),
+            "audience_type": clean_text(parsed.get("audience_type")),
+            "languages": clean_text(parsed.get("languages")),
+            "notes": clean_text(parsed.get("notes")),
             "extracted_data": parsed
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error parsing creator reply: {str(e)}")
+
+
+# ============ CAMPAIGNS ============
+BRIEF_FIELDS = [
+    "pricing_model", "total_budget", "rate_per_collab", "slots", "budget_text",
+    "platform", "niche", "target_audience", "location_requirement",
+    "deliverables", "requirements", "timeline_days"
+]
+
+
+class CampaignFromBriefRequest(BaseModel):
+    brand_id: str
+    gmail_thread_id: Optional[str] = None
+    source: str = "email_reply"
+    pricing_model: Optional[str] = None
+    total_budget: Optional[int] = None
+    rate_per_collab: Optional[int] = None
+    slots: Optional[int] = None
+    budget_text: Optional[str] = None
+    platform: Optional[str] = None
+    niche: Optional[str] = None
+    target_audience: Optional[str] = None
+    location_requirement: Optional[str] = None
+    deliverables: Optional[str] = None
+    requirements: Optional[str] = None
+    timeline_days: Optional[int] = None
+
+
+def load_settings() -> dict:
+    """Read business rules from the settings table"""
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT key, value FROM settings")).fetchall()
+    return {key: float(value) for key, value in rows}
+
+
+@app.post("/campaigns/upsert-from-brief")
+async def upsert_campaign_from_brief(req: CampaignFromBriefRequest):
+    """
+    Create a campaign from a brand's brief, or update the open campaign
+    in the same email thread. Snapshots the current business rules.
+    """
+    try:
+        s = load_settings()
+        brief = {f: getattr(req, f) for f in BRIEF_FIELDS}
+
+        # Infer pricing model only when budget info exists
+        if brief["pricing_model"] not in ("campaign_pool", "per_collab"):
+            if req.rate_per_collab and not req.total_budget:
+                brief["pricing_model"] = "per_collab"
+            elif req.total_budget:
+                brief["pricing_model"] = "campaign_pool"
+            else:
+                brief["pricing_model"] = None
+
+        # Deal value decides exclusivity and revision rules
+        deal_value = req.total_budget or (
+            req.rate_per_collab * (req.slots or 1) if req.rate_per_collab else None
+        )
+        terms = {"exclusivity_days": None, "revisions_allowed": None}
+        if deal_value:
+            is_small = deal_value < s.get("small_deal_threshold_inr", 25000)
+            terms["exclusivity_days"] = 0 if is_small else int(s.get("exclusivity_days", 30))
+            terms["revisions_allowed"] = int(
+                s.get("revisions_small", 1) if is_small else s.get("revisions_campaign", 2)
+            )
+        below_minimum = bool(deal_value and deal_value < s.get("min_deal_inr", 5000))
+
+        with engine.begin() as conn:
+            existing = None
+            if req.gmail_thread_id:
+                existing = conn.execute(text("""
+                    SELECT campaign_id FROM campaigns
+                    WHERE gmail_thread_id = :thread
+                      AND status NOT IN ('completed', 'cancelled', 'lost')
+                    ORDER BY id DESC LIMIT 1
+                """), {"thread": req.gmail_thread_id}).first()
+
+            update_fields = BRIEF_FIELDS + ["exclusivity_days", "revisions_allowed"]
+
+            if existing:
+                campaign_id = existing[0]
+                # Only fill in what the new reply mentions, never erase existing details
+                set_clause = ", ".join(f"{f} = COALESCE(:{f}, {f})" for f in update_fields)
+                conn.execute(
+                    text(f"UPDATE campaigns SET {set_clause} WHERE campaign_id = :campaign_id"),
+                    {**brief, **terms, "campaign_id": campaign_id}
+                )
+                action = "updated"
+            else:
+                campaign_id = f"CMP_{req.brand_id}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+                if brief["pricing_model"] is None:
+                    brief["pricing_model"] = "campaign_pool"
+                params = {
+                    "campaign_id": campaign_id,
+                    "brand_id": req.brand_id,
+                    "source": req.source,
+                    "gmail_thread_id": req.gmail_thread_id,
+                    "margin_target": s.get("margin_target"),
+                    "margin_floor": s.get("margin_floor"),
+                    "advance_pct": s.get("advance_pct"),
+                    **brief,
+                    **terms
+                }
+                columns = list(params.keys())
+                conn.execute(
+                    text(f"INSERT INTO campaigns ({', '.join(columns)}) "
+                         f"VALUES ({', '.join(':' + c for c in columns)})"),
+                    params
+                )
+                action = "created"
+
+            row = conn.execute(
+                text("SELECT * FROM campaigns WHERE campaign_id = :campaign_id"),
+                {"campaign_id": campaign_id}
+            ).mappings().first()
+
+        return {
+            "status": "success",
+            "action": action,
+            "deal_value": deal_value,
+            "below_minimum": below_minimum,
+            "campaign": jsonable_encoder(dict(row))
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error saving campaign: {str(e)}")
 
 
 # ============ BRANDS CRUD ============
