@@ -42,7 +42,19 @@ app.add_middleware(
 )
 
 # ============ DATABASE ============
-engine = create_engine(DATABASE_URL, echo=DEBUG)
+engine = create_engine(
+    DATABASE_URL,
+    echo=DEBUG,
+    pool_pre_ping=True,      # test each pooled connection before use; replace it if Supabase closed it
+    pool_recycle=280,        # never reuse a connection older than ~5 minutes
+    connect_args={
+        "connect_timeout": 10,       # fail fast instead of hanging when the database can't be reached
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5,
+    },
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
