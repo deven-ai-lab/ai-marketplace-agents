@@ -1964,7 +1964,8 @@ Return ONLY a JSON object, no other text:
 OFFER_INTENTS = {"accept", "decline", "counter", "question", "auto_reply", "unsubscribe"}
 
 
-def build_acceptance_email(first_name, brand_name, deliverable, deadline, amount, script_step, s) -> str:
+def build_acceptance_email(first_name, brand_name, deliverable, deadline, amount, script_step, s,
+                           opening: str = "Thank you, and welcome aboard! 🎉") -> str:
     """Confirmation after a creator accepts. Honest: the brand still gives final confirmation."""
     steps = [f"Once {brand_name} gives final confirmation, we'll send you the full brief."]
     if script_step:
@@ -1974,7 +1975,7 @@ def build_acceptance_email(first_name, brand_name, deliverable, deadline, amount
 
     return f"""Hi {first_name},
 
-Thank you, and welcome aboard! 🎉
+{opening}
 
 The brand is {brand_name}. You're now on the final creator lineup we're presenting to them, and we'll confirm with you shortly.
 
@@ -2113,7 +2114,7 @@ Return ONLY the JSON object."""
                     f"💬 *{name}* countered on the {brand} offer: asks *{format_inr(counter_amount)}* "
                     f"(offered {format_inr(offered)}).\n"
                     f"Your margin on this slot would be *{pct(m)}* (target {pct(margin_target)}, floor {pct(margin_floor)}){warn}.\n"
-                    f"Reply to them in Gmail for now. Slack buttons for counters come next."
+                    f"Use the form below to accept, decline, or offer a different amount."
                 )
                 result["slack_replies_text"] = f"💬 *{name}* countered on {brand}: {format_inr(counter_amount)} vs {format_inr(offered)} offered."
 
@@ -2194,6 +2195,226 @@ Return ONLY the JSON object."""
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error handling offer reply: {str(e)}")
+
+
+# ============ COUNTERS + EXPIRY (STAGE 5, PHASE C) ============
+def build_revised_offer_email(first_name, amount, deliverable, deadline, expires_at, note, s) -> str:
+    note_block = f"\n\n{note.strip()}" if note and note.strip() else ""
+    return f"""Hi {first_name},
+
+Thanks for coming back to us. We can offer {format_inr(amount)} for this collaboration.{note_block}
+
+Everything else stays the same:
+• Deliverables: {deliverable or 'to be confirmed with the brief'}
+• Content deadline: {deadline.strftime('%d %b %Y') if deadline else 'to be confirmed with the brief'}
+• Your payout: {format_inr(amount)}
+• Payment: {creator_payment_terms(amount, s)}
+• This offer is open until {expires_at.astimezone(IST).strftime('%d %b, %I:%M %p')} IST
+
+Just reply "Accept" to confirm.
+
+Aditya
+Creator Manager"""
+
+
+def build_counter_decline_email(first_name, counter_amount) -> str:
+    return f"""Hi {first_name},
+
+Thanks for sharing your rate. Unfortunately we can't go up to {format_inr(counter_amount)} for this campaign, so we'll have to pass this time.
+
+We'd love to work with you on a future campaign that fits your rate better.
+
+Aditya
+Creator Manager"""
+
+
+def build_expiry_email(first_name) -> str:
+    return f"""Hi {first_name},
+
+Just a quick note: the collaboration offer we sent has now closed, as we needed to confirm creators for the campaign.
+
+No worries at all. We'll reach out again when a campaign that suits you comes up.
+
+Aditya
+Creator Manager"""
+
+
+def _slot_status(conn, campaign_id, pricing_model, slots):
+    """(accepted, target) for a campaign"""
+    accepted = conn.execute(text("""
+        SELECT COUNT(*) FROM offers WHERE campaign_id = :cid AND status = 'accepted'
+    """), {"cid": campaign_id}).scalar() or 0
+    if pricing_model == "per_collab":
+        target = slots or 1
+    else:
+        target = conn.execute(text("""
+            SELECT COUNT(*) FROM matches WHERE campaign_id = :cid AND approval_status = 'approved'
+        """), {"cid": campaign_id}).scalar() or 0
+    return accepted, target
+
+
+class ResolveCounterRequest(BaseModel):
+    offer_id: str
+    decision: str                 # "Accept their number" / "Decline" / "Offer a different amount"
+    amount: Optional[int] = None  # only for a different amount
+    note: Optional[str] = None    # optional line added to the creator email
+
+
+@app.post("/offers/resolve-counter")
+async def resolve_counter(req: ResolveCounterRequest):
+    """Apply Deven's decision on a counter-offer and return the email Aditya should send"""
+    try:
+        s = load_settings()
+        d = (req.decision or "").strip().lower()
+        if d.startswith("accept"):
+            decision = "accept"
+        elif d.startswith("decline"):
+            decision = "decline"
+        elif d.startswith("offer") or d.startswith("propose") or "different" in d:
+            decision = "propose"
+        else:
+            raise HTTPException(status_code=400, detail="decision must be accept, decline or a different amount")
+        if decision == "propose" and (not req.amount or req.amount <= 0):
+            raise HTTPException(status_code=400, detail="A different amount needs a number")
+
+        with engine.begin() as conn:
+            offer = conn.execute(text("""
+                SELECT o.*, cr.creator_name, c.pricing_model, c.rate_per_collab, c.total_budget, c.slots,
+                       c.timeline_days, c.margin_floor, b.brand_name
+                FROM offers o
+                JOIN creators cr ON cr.creator_id = o.creator_id
+                JOIN campaigns c ON c.campaign_id = o.campaign_id
+                JOIN brands b ON b.brand_id = c.brand_id
+                WHERE o.offer_id = :oid
+            """), {"oid": req.offer_id}).mappings().first()
+            if not offer:
+                raise HTTPException(status_code=404, detail="Offer not found")
+            offer = dict(offer)
+
+            base = {"status": "success", "offer_id": req.offer_id, "campaign_id": offer["campaign_id"],
+                    "decision": decision, "reply_email": None, "reply_to_message_id": None,
+                    "new_offer_id": None, "start_next_offers": False, "slack_text": None}
+
+            if offer["status"] != "countered":
+                return {**base, "status": "skipped",
+                        "slack_text": f"ℹ️ The offer to {offer['creator_name']} is already `{offer['status']}`, so nothing was changed."}
+
+            # Reply to the creator's latest message in this thread
+            reply_to = conn.execute(text("""
+                SELECT gmail_message_id FROM conversations
+                WHERE gmail_thread_id = :t AND direction = 'inbound'
+                ORDER BY created_at DESC LIMIT 1
+            """), {"t": offer["gmail_thread_id"]}).scalar() or offer["gmail_message_id"]
+
+            first = _first_name(offer["creator_name"])
+            name, brand = offer["creator_name"], offer["brand_name"]
+            counter = offer["counter_amount"]
+            base["reply_to_message_id"] = reply_to
+
+            if decision == "accept":
+                conn.execute(text("""
+                    UPDATE offers SET status = 'accepted', final_amount = :final WHERE offer_id = :oid
+                """), {"final": counter, "oid": req.offer_id})
+                deal_value = offer["total_budget"] or ((offer["rate_per_collab"] or 0) * (offer["slots"] or 1))
+                script_step = deal_value >= float(s.get("small_deal_threshold_inr", 25000))
+                base["reply_email"] = build_acceptance_email(
+                    first, brand, offer["deliverables"], offer["deadline"], counter, script_step, s,
+                    opening=f"Good news: we can do {format_inr(counter)}. Welcome aboard! 🎉")
+                accepted, target = _slot_status(conn, offer["campaign_id"], offer["pricing_model"], offer["slots"])
+                text_out = f"✅ Counter accepted: *{name}* joins {brand} at {format_inr(counter)}. {accepted}/{target} slot(s) filled."
+                if target and accepted >= target:
+                    text_out += f"\n🎯 *All {target} slot(s) filled for {brand}*. Ready to send the shortlist to the brand."
+                base["slack_text"] = text_out
+
+            elif decision == "decline":
+                conn.execute(text("""
+                    UPDATE offers SET status = 'declined', decline_reason = :reason WHERE offer_id = :oid
+                """), {"reason": f"counter of {counter} declined by agency", "oid": req.offer_id})
+                base["reply_email"] = build_counter_decline_email(first, counter)
+                base["start_next_offers"] = True
+                base["slack_text"] = (f"❌ Counter declined: *{name}* ({format_inr(counter)}) is out of {brand}. "
+                                      f"Sending the next offer if an approved creator is available.")
+
+            else:  # propose a different amount: new negotiation round
+                amount = int(req.amount)
+                short = offer["timeline_days"] is not None and offer["timeline_days"] <= int(s.get("short_timeline_days", 7))
+                hours = int(s.get("offer_expiry_hours_short", 24) if short else s.get("offer_expiry_hours", 48))
+                expires_at = datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(hours=hours)
+                new_round = (offer["round"] or 1) + 1
+                new_id = f"OFR_{offer['campaign_id']}_{offer['creator_id']}_R{new_round}"
+                rate = offer["rate_per_collab"] if offer["pricing_model"] == "per_collab" else None
+                body = build_revised_offer_email(first, amount, offer["deliverables"], offer["deadline"],
+                                                 expires_at, req.note, s)
+
+                conn.execute(text("UPDATE offers SET status = 'withdrawn' WHERE offer_id = :oid"),
+                             {"oid": req.offer_id})
+                conn.execute(text("DELETE FROM offers WHERE offer_id = :nid AND status = 'draft'"), {"nid": new_id})
+                conn.execute(text("""
+                    INSERT INTO offers (offer_id, campaign_id, creator_id, match_id, round, offered_amount,
+                        brand_price_share, margin_pct, deliverables, deadline, exclusivity_days, status,
+                        expires_at, subject, body, gmail_thread_id)
+                    VALUES (:nid, :cid, :creator, :match, :round, :amount, :share, :margin, :deliverables,
+                        :deadline, :excl, 'draft', :expires, :subject, :body, :thread)
+                """), {
+                    "nid": new_id, "cid": offer["campaign_id"], "creator": offer["creator_id"],
+                    "match": offer["match_id"], "round": new_round, "amount": amount, "share": rate,
+                    "margin": round(1 - amount / rate, 3) if rate else None,
+                    "deliverables": offer["deliverables"], "deadline": offer["deadline"],
+                    "excl": offer["exclusivity_days"], "expires": expires_at.replace(tzinfo=None),
+                    "subject": f"Revised offer: {format_inr(amount)}", "body": body,
+                    "thread": offer["gmail_thread_id"],
+                })
+                base["new_offer_id"] = new_id
+                base["reply_email"] = body
+                margin = f" Your margin on this slot: {round((1 - amount / rate) * 100)}%." if rate else ""
+                base["slack_text"] = (f"💬 Revised offer sent to *{name}*: {format_inr(amount)} "
+                                      f"(they asked {format_inr(counter)}).{margin}")
+
+        return base
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error resolving counter: {str(e)}")
+
+
+@app.post("/offers/expire")
+async def expire_offers():
+    """Close offers nobody answered in time. Counters waiting on Deven never expire."""
+    try:
+        with engine.begin() as conn:
+            rows = [dict(r) for r in conn.execute(text("""
+                UPDATE offers o SET status = 'expired'
+                FROM creators cr, campaigns c, brands b
+                WHERE o.status = 'sent'
+                  AND o.expires_at IS NOT NULL AND o.expires_at < NOW()
+                  AND cr.creator_id = o.creator_id
+                  AND c.campaign_id = o.campaign_id
+                  AND b.brand_id = c.brand_id
+                RETURNING o.offer_id, o.campaign_id, o.gmail_message_id, o.gmail_thread_id,
+                          cr.creator_name, b.brand_name
+            """)).mappings().all()]
+
+        expired = [{
+            "offer_id": r["offer_id"],
+            "campaign_id": r["campaign_id"],
+            "creator_name": r["creator_name"],
+            "brand_name": r["brand_name"],
+            "reply_to_message_id": r["gmail_message_id"],   # our offer email: the note goes in the same thread
+            "note_email": build_expiry_email(_first_name(r["creator_name"])),
+        } for r in rows]
+        campaigns = [{"campaign_id": cid} for cid in sorted({r["campaign_id"] for r in rows})]
+
+        slack_text = None
+        if expired:
+            lines = [f"⌛ *{len(expired)} offer(s) expired* with no reply:"]
+            lines += [f"• {e['creator_name']} ({e['brand_name']})" for e in expired]
+            lines.append("Next offers are going out where approved creators are available.")
+            slack_text = "\n".join(lines)
+
+        return {"status": "success", "count": len(expired), "expired": expired,
+                "campaigns": campaigns, "slack_text": slack_text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error expiring offers: {str(e)}")
 
 
 # ============ BRANDS CRUD ============
