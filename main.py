@@ -1627,13 +1627,21 @@ def _strip_brand(text_value: str, brand_name: str) -> str:
     return re.sub(re.escape(brand_name.strip()), "the brand", text_value, flags=re.IGNORECASE)
 
 
+def creator_payment_terms(amount, s: dict) -> str:
+    """How and when a creator gets paid. The single source for every creator-facing email."""
+    payment_days = int(s.get("creator_payment_days", 7))
+    advance_pct = int(float(s.get("creator_advance_pct", 0.3)) * 100)
+    advance_min = float(s.get("creator_advance_min_fee", 25000))
+    terms = f"100% within {payment_days} days after your post is verified live"
+    if amount >= advance_min:
+        terms += f" ({advance_pct}% of your payout upfront is available on request once the brand confirms)"
+    return terms
+
+
 def build_offer_terms(amount, deliverables, platform, deadline, revisions, exclusivity_days,
                       industry, expires_at, s: dict) -> str:
     """The binding part of every offer: always generated from data, never by the model"""
-    payment_days = int(s.get("creator_payment_days", 7))
     kill_fee = int(float(s.get("kill_fee_pct", 0.5)) * 100)
-    advance_pct = int(float(s.get("creator_advance_pct", 0.3)) * 100)
-    advance_min = float(s.get("creator_advance_min_fee", 25000))
 
     lines = [
         "Here are the details:",
@@ -1643,10 +1651,7 @@ def build_offer_terms(amount, deliverables, platform, deadline, revisions, exclu
         lines.append(f"• Platform: {platform}")
     lines.append(f"• Content deadline: {deadline.strftime('%d %b %Y') if deadline else 'to be confirmed with the brief'}")
     lines.append(f"• Your payout: {format_inr(amount)}")
-    payment = f"• Payment: 100% within {payment_days} days after your post is verified live"
-    if amount >= advance_min:
-        payment += f" ({advance_pct}% of your payout upfront is available on request once the brand confirms)"
-    lines.append(payment)
+    lines.append(f"• Payment: {creator_payment_terms(amount, s)}")
     if revisions:
         lines.append(f"• Revisions: up to {revisions} round{'s' if revisions > 1 else ''} of changes")
     if exclusivity_days:
@@ -1932,6 +1937,263 @@ async def mark_offer_sent(req: OfferSentRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error marking offer sent: {str(e)}")
+
+
+# ============ OFFER REPLIES (STAGE 5, PHASE B) ============
+OFFER_REPLY_PROMPT = """You are Aditya, Creator Manager at an influencer marketing agency in India.
+A creator replied to a paid collaboration offer. Classify the reply.
+
+INTENT (pick exactly one):
+- "accept": clearly agrees, with NO conditions and NO questions.
+  e.g. "Yes, I accept", "I accept your offer", "Deal", "Sounds good, count me in"
+- "decline": says no, not interested, or not available
+- "counter": asks for a different payout, or accepts only if the payout changes
+- "question": asks something, or adds conditions (dates, deliverables, advance, brand name)
+  without clearly accepting or declining
+- "auto_reply": out-of-office or automated message
+- "unsubscribe": asks not to be contacted again
+
+counter_amount: the payout they ask for, as an integer in INR ("12k" = 12000, "1.5L" = 150000), else null.
+Never guess an amount.
+
+Return ONLY a JSON object, no other text:
+{"intent": "accept", "counter_amount": null, "reason": "short reason if they declined, else null",
+ "questions": ["any questions they asked"], "summary": "one sentence for the founder"}
+"""
+
+OFFER_INTENTS = {"accept", "decline", "counter", "question", "auto_reply", "unsubscribe"}
+
+
+def build_acceptance_email(first_name, brand_name, deliverable, deadline, amount, script_step, s) -> str:
+    """Confirmation after a creator accepts. Honest: the brand still gives final confirmation."""
+    steps = [f"Once {brand_name} gives final confirmation, we'll send you the full brief."]
+    if script_step:
+        steps.append("Before shooting, you'll share a short script or concept so the brand can approve the direction.")
+    steps.append("After the brand approves your content, you post it, and we take care of the rest.")
+    numbered = "\n".join(f"{i}. {step}" for i, step in enumerate(steps, start=1))
+
+    return f"""Hi {first_name},
+
+Thank you, and welcome aboard! 🎉
+
+The brand is {brand_name}. You're now on the final creator lineup we're presenting to them, and we'll confirm with you shortly.
+
+Here's a recap of what you accepted:
+• Deliverables: {deliverable or 'to be confirmed with the brief'}
+• Content deadline: {deadline.strftime('%d %b %Y') if deadline else 'to be confirmed with the brief'}
+• Your payout: {format_inr(amount)}
+• Payment: {creator_payment_terms(amount, s)}
+
+What happens next:
+{numbered}
+
+Reply here anytime if you have questions.
+
+Aditya
+Creator Manager"""
+
+
+def build_decline_email(first_name, unsubscribed: bool) -> str:
+    if unsubscribed:
+        body = "Understood. We've removed you from our list and won't contact you again."
+    else:
+        body = ("No problem at all, thanks for letting us know. "
+                "We'll keep you in mind for future campaigns that suit you better.")
+    return f"Hi {first_name},\n\n{body}\n\nAditya\nCreator Manager"
+
+
+class OfferReplyRequest(BaseModel):
+    offer_id: str
+    gmail_message_id: str                   # the creator's reply
+    gmail_thread_id: Optional[str] = None
+    from_email: Optional[str] = None
+    reply_subject: Optional[str] = None
+    reply_body: str
+
+
+@app.post("/offers/parse-reply")
+async def parse_offer_reply(req: OfferReplyRequest):
+    """
+    Understand a creator's reply to an offer and apply the rules:
+    accept -> confirm + reveal brand, decline -> thank + next creator,
+    counter / question -> Deven in Slack. Returns what N8N should send.
+    """
+    try:
+        s = load_settings()
+
+        with engine.connect() as conn:
+            # The same email is never processed twice
+            if conn.execute(text("SELECT 1 FROM conversations WHERE gmail_message_id = :m"),
+                            {"m": req.gmail_message_id}).first():
+                return {"status": "success", "action": "duplicate", "offer_id": req.offer_id,
+                        "reply_email": None, "start_next_offers": False,
+                        "slack_replies_text": None, "slack_approvals_text": None}
+
+            offer = conn.execute(text("""
+                SELECT o.*, cr.creator_name, c.campaign_id AS cid, c.pricing_model, c.rate_per_collab,
+                       c.total_budget, c.slots, c.margin_target, c.margin_floor, b.brand_name
+                FROM offers o
+                JOIN creators cr ON cr.creator_id = o.creator_id
+                JOIN campaigns c ON c.campaign_id = o.campaign_id
+                JOIN brands b ON b.brand_id = c.brand_id
+                WHERE o.offer_id = :oid
+            """), {"oid": req.offer_id}).mappings().first()
+        if not offer:
+            raise HTTPException(status_code=404, detail="Offer not found")
+        offer = dict(offer)
+
+        # ---------- Classify the reply ----------
+        message = f"""OFFER
+Payout offered: INR {offer['offered_amount']}
+Deliverables: {offer['deliverables'] or 'not specified'}
+
+CREATOR'S REPLY:
+{strip_quoted_reply(req.reply_body)}
+
+Return ONLY the JSON object."""
+        parsed = parse_json_object(await call_claude(OFFER_REPLY_PROMPT, message))
+        intent = str(parsed.get("intent", "question")).strip().lower()
+        if intent not in OFFER_INTENTS:
+            intent = "question"
+        counter_amount = to_int_or_none(parsed.get("counter_amount"))
+        if intent == "counter" and not counter_amount:
+            intent = "question"          # a counter without a number needs a human
+        questions = parsed.get("questions") or []
+        reason = clean_text(parsed.get("reason"))
+        summary = parsed.get("summary") or ""
+
+        name = offer["creator_name"]
+        first = _first_name(name)
+        brand = offer["brand_name"]
+        offered = offer["offered_amount"]
+        margin_target = float(offer["margin_target"] or s.get("margin_target", 0.30))
+        margin_floor = float(offer["margin_floor"] or s.get("margin_floor", 0.20))
+
+        result = {"status": "success", "offer_id": req.offer_id, "campaign_id": offer["cid"],
+                  "intent": intent, "summary": summary, "reply_email": None,
+                  "start_next_offers": False, "slack_approvals_text": None,
+                  "slack_replies_text": None, "all_slots_filled": False}
+
+        # Replies after the offer is already settled: just keep Deven informed
+        if offer["status"] not in ("sent", "countered"):
+            if intent != "auto_reply":
+                result["slack_replies_text"] = f"💬 *{name}* wrote again about the {brand} offer ({offer['status']}): {summary}"
+                if questions:
+                    result["slack_approvals_text"] = (f"❓ *{name}* has a question about the {brand} offer:\n"
+                                                      + "\n".join(f"• {q}" for q in questions)
+                                                      + "\nReply to them in Gmail in the same thread.")
+            action = "note"
+        else:
+            action = intent
+
+        # ---------- Margin if a counter were accepted ----------
+        def margin_at(amount: int):
+            if offer["pricing_model"] == "per_collab" and offer["rate_per_collab"]:
+                return 1 - amount / offer["rate_per_collab"]
+            if offer["total_budget"]:
+                with engine.connect() as c2:
+                    committed = c2.execute(text("""
+                        SELECT COALESCE(SUM(COALESCE(final_amount, offered_amount)), 0) FROM offers
+                        WHERE campaign_id = :cid AND offer_id <> :oid AND status IN ('sent', 'accepted', 'countered')
+                    """), {"cid": offer["cid"], "oid": req.offer_id}).scalar() or 0
+                return 1 - (committed + amount) / offer["total_budget"]
+            return None
+
+        auto_accept_margin = float(s.get("counter_auto_accept_margin", 0))
+        accepted_amount = None
+
+        if action == "counter":
+            m = margin_at(counter_amount)
+            if auto_accept_margin > 0 and m is not None and m >= auto_accept_margin:
+                action, accepted_amount = "accept", counter_amount       # auto-accept is switched on and margin holds
+            else:
+                pct = lambda x: f"{round(x * 100)}%" if x is not None else "unknown"
+                warn = " 🔴 *below your floor*" if (m is not None and m < margin_floor) else ""
+                result["slack_approvals_text"] = (
+                    f"💬 *{name}* countered on the {brand} offer: asks *{format_inr(counter_amount)}* "
+                    f"(offered {format_inr(offered)}).\n"
+                    f"Your margin on this slot would be *{pct(m)}* (target {pct(margin_target)}, floor {pct(margin_floor)}){warn}.\n"
+                    f"Reply to them in Gmail for now. Slack buttons for counters come next."
+                )
+                result["slack_replies_text"] = f"💬 *{name}* countered on {brand}: {format_inr(counter_amount)} vs {format_inr(offered)} offered."
+
+        if action == "question":
+            result["slack_approvals_text"] = (f"❓ *{name}* has a question about the {brand} offer:\n"
+                                              + ("\n".join(f"• {q}" for q in questions) if questions else f"• {summary}")
+                                              + "\nReply to them in Gmail in the same thread.")
+            result["slack_replies_text"] = f"❓ *{name}* asked about the {brand} offer: {summary}"
+
+        # ---------- Apply state changes ----------
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO conversations (contact_type, contact_id, gmail_thread_id, gmail_message_id,
+                                           direction, from_email, subject, body, intent, extracted_data)
+                VALUES ('creator', :cid, :thread, :msg, 'inbound', :from_email, :subject, :body,
+                        :intent, CAST(:data AS JSONB))
+                ON CONFLICT (gmail_message_id) DO NOTHING
+            """), {"cid": offer["creator_id"], "thread": req.gmail_thread_id, "msg": req.gmail_message_id,
+                   "from_email": req.from_email, "subject": req.reply_subject, "body": req.reply_body,
+                   "intent": f"offer_{intent}", "data": json.dumps(parsed)})
+
+            if action == "accept":
+                final = accepted_amount or offered
+                conn.execute(text("""
+                    UPDATE offers SET status = 'accepted', final_amount = :final,
+                           counter_amount = COALESCE(:counter, counter_amount), responded_at = NOW()
+                    WHERE offer_id = :oid
+                """), {"final": final, "counter": accepted_amount, "oid": req.offer_id})
+
+                deal_value = offer["total_budget"] or ((offer["rate_per_collab"] or 0) * (offer["slots"] or 1))
+                script_step = deal_value >= float(s.get("small_deal_threshold_inr", 25000))
+                result["reply_email"] = build_acceptance_email(
+                    first, brand, offer["deliverables"], offer["deadline"], final, script_step, s)
+
+                # Slots filled?
+                accepted = conn.execute(text("""
+                    SELECT COUNT(*) FROM offers WHERE campaign_id = :cid AND status = 'accepted'
+                """), {"cid": offer["cid"]}).scalar() or 0
+                if offer["pricing_model"] == "per_collab":
+                    target = offer["slots"] or 1
+                else:
+                    target = conn.execute(text("""
+                        SELECT COUNT(*) FROM matches WHERE campaign_id = :cid AND approval_status = 'approved'
+                    """), {"cid": offer["cid"]}).scalar() or 0
+                note = " (accepted your counter)" if accepted_amount else ""
+                result["slack_replies_text"] = (f"✅ *{name}* accepted the {brand} offer{note} at {format_inr(final)}. "
+                                                f"{accepted}/{target} slot(s) filled.")
+                if target and accepted >= target:
+                    result["all_slots_filled"] = True
+                    result["slack_approvals_text"] = (f"🎯 *All {target} slot(s) filled for {brand}* "
+                                                      f"(`{offer['cid']}`). Ready to send the shortlist to the brand.")
+
+            elif action in ("decline", "unsubscribe"):
+                conn.execute(text("""
+                    UPDATE offers SET status = 'declined', decline_reason = :reason, responded_at = NOW()
+                    WHERE offer_id = :oid
+                """), {"reason": reason or ("unsubscribed" if action == "unsubscribe" else None), "oid": req.offer_id})
+                if action == "unsubscribe":
+                    conn.execute(text("""
+                        UPDATE creators SET unsubscribed = TRUE, status = 'unsubscribed' WHERE creator_id = :cid
+                    """), {"cid": offer["creator_id"]})
+                result["reply_email"] = build_decline_email(first, action == "unsubscribe")
+                result["start_next_offers"] = True
+                why = f" ({reason})" if reason else ""
+                result["slack_replies_text"] = (f"❌ *{name}* declined the {brand} offer{why}. "
+                                                f"Sending the next offer if an approved creator is available.")
+
+            elif action == "counter":
+                conn.execute(text("""
+                    UPDATE offers SET status = 'countered', counter_amount = :amt, responded_at = NOW()
+                    WHERE offer_id = :oid
+                """), {"amt": counter_amount, "oid": req.offer_id})
+
+        result["action"] = action
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error handling offer reply: {str(e)}")
 
 
 # ============ BRANDS CRUD ============
