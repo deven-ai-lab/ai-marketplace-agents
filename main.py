@@ -2030,18 +2030,24 @@ async def parse_offer_reply(req: OfferReplyRequest):
                         "reply_email": None, "start_next_offers": False,
                         "slack_replies_text": None, "slack_approvals_text": None}
 
+            # Always use the LATEST round of this negotiation (a revised offer shares the thread)
             offer = conn.execute(text("""
+                WITH requested AS (SELECT campaign_id, creator_id FROM offers WHERE offer_id = :oid)
                 SELECT o.*, cr.creator_name, c.campaign_id AS cid, c.pricing_model, c.rate_per_collab,
                        c.total_budget, c.slots, c.margin_target, c.margin_floor, b.brand_name
                 FROM offers o
+                JOIN requested r ON r.campaign_id = o.campaign_id AND r.creator_id = o.creator_id
                 JOIN creators cr ON cr.creator_id = o.creator_id
                 JOIN campaigns c ON c.campaign_id = o.campaign_id
                 JOIN brands b ON b.brand_id = c.brand_id
-                WHERE o.offer_id = :oid
+                WHERE o.status <> 'draft'
+                ORDER BY o.round DESC
+                LIMIT 1
             """), {"oid": req.offer_id}).mappings().first()
         if not offer:
             raise HTTPException(status_code=404, detail="Offer not found")
         offer = dict(offer)
+        oid = offer["offer_id"]
 
         # ---------- Classify the reply ----------
         message = f"""OFFER
@@ -2070,7 +2076,7 @@ Return ONLY the JSON object."""
         margin_target = float(offer["margin_target"] or s.get("margin_target", 0.30))
         margin_floor = float(offer["margin_floor"] or s.get("margin_floor", 0.20))
 
-        result = {"status": "success", "offer_id": req.offer_id, "campaign_id": offer["cid"],
+        result = {"status": "success", "offer_id": oid, "campaign_id": offer["cid"],
                   "intent": intent, "summary": summary, "reply_email": None,
                   "start_next_offers": False, "slack_approvals_text": None,
                   "slack_replies_text": None, "all_slots_filled": False}
@@ -2096,7 +2102,7 @@ Return ONLY the JSON object."""
                     committed = c2.execute(text("""
                         SELECT COALESCE(SUM(COALESCE(final_amount, offered_amount)), 0) FROM offers
                         WHERE campaign_id = :cid AND offer_id <> :oid AND status IN ('sent', 'accepted', 'countered')
-                    """), {"cid": offer["cid"], "oid": req.offer_id}).scalar() or 0
+                    """), {"cid": offer["cid"], "oid": oid}).scalar() or 0
                 return 1 - (committed + amount) / offer["total_budget"]
             return None
 
@@ -2142,7 +2148,7 @@ Return ONLY the JSON object."""
                     UPDATE offers SET status = 'accepted', final_amount = :final,
                            counter_amount = COALESCE(:counter, counter_amount), responded_at = NOW()
                     WHERE offer_id = :oid
-                """), {"final": final, "counter": accepted_amount, "oid": req.offer_id})
+                """), {"final": final, "counter": accepted_amount, "oid": oid})
 
                 deal_value = offer["total_budget"] or ((offer["rate_per_collab"] or 0) * (offer["slots"] or 1))
                 script_step = deal_value >= float(s.get("small_deal_threshold_inr", 25000))
@@ -2171,7 +2177,7 @@ Return ONLY the JSON object."""
                 conn.execute(text("""
                     UPDATE offers SET status = 'declined', decline_reason = :reason, responded_at = NOW()
                     WHERE offer_id = :oid
-                """), {"reason": reason or ("unsubscribed" if action == "unsubscribe" else None), "oid": req.offer_id})
+                """), {"reason": reason or ("unsubscribed" if action == "unsubscribe" else None), "oid": oid})
                 if action == "unsubscribe":
                     conn.execute(text("""
                         UPDATE creators SET unsubscribed = TRUE, status = 'unsubscribed' WHERE creator_id = :cid
@@ -2186,7 +2192,7 @@ Return ONLY the JSON object."""
                 conn.execute(text("""
                     UPDATE offers SET status = 'countered', counter_amount = :amt, responded_at = NOW()
                     WHERE offer_id = :oid
-                """), {"amt": counter_amount, "oid": req.offer_id})
+                """), {"amt": counter_amount, "oid": oid})
 
         result["action"] = action
         return result
