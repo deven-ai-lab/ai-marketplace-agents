@@ -1629,13 +1629,11 @@ def _strip_brand(text_value: str, brand_name: str) -> str:
 
 def creator_payment_terms(amount, s: dict) -> str:
     """How and when a creator gets paid. The single source for every creator-facing email."""
-    payment_days = int(s.get("creator_payment_days", 7))
-    advance_pct = int(float(s.get("creator_advance_pct", 0.3)) * 100)
-    advance_min = float(s.get("creator_advance_min_fee", 25000))
-    terms = f"100% within {payment_days} days after your post is verified live"
-    if amount >= advance_min:
-        terms += f" ({advance_pct}% of your payout upfront is available on request once the brand confirms)"
-    return terms
+    first = int(round(float(s.get("creator_first_payment_pct", 0.3)) * 100))
+    hours_min = int(s.get("creator_final_payment_hours_min", 48))
+    hours_max = int(s.get("creator_final_payment_hours_max", 58))
+    return (f"{first}% once the brand approves your content, and the remaining {100 - first}% "
+            f"within {hours_min}-{hours_max} hours after your post goes live")
 
 
 def build_offer_terms(amount, deliverables, platform, deadline, revisions, exclusivity_days,
@@ -1657,7 +1655,7 @@ def build_offer_terms(amount, deliverables, platform, deadline, revisions, exclu
     if exclusivity_days:
         category = (industry or "competing").strip()
         lines.append(f"• Exclusivity: no posts for competing {category} brands for {exclusivity_days} days after publishing")
-    lines.append(f"• Cancellation: if the brand cancels after you've created the content, you receive {kill_fee}% of the payout")
+    lines.append(f"• Cancellation: if the brand cancels after you've created the content, you receive {kill_fee}% of the payout in total")
     lines.append(f"• This offer is open until {expires_at.astimezone(IST).strftime('%d %b, %I:%M %p')} IST")
     lines += [
         "",
