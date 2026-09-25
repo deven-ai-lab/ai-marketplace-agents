@@ -435,7 +435,9 @@ For each creator provided, generate a professional pitch email that:
 2. Explains what you do (connect creators with premium brands)
 3. Highlights the opportunity (paid collaborations, exposure, products)
 4. Asks for their details (min budget, restrictions, availability, best format)
-5. Calls them to action
+5. Makes clear that joining is completely free: we never charge creators anything,
+   and they keep their full payout because the brand pays us
+6. Calls them to action
 
 Email must be:
 - Professional but friendly
@@ -866,7 +868,7 @@ async def upsert_campaign_from_brief(req: CampaignFromBriefRequest):
 
 
 # ============ FRED: MATCHING AGENT ============
-FRED_MODEL = "claude-sonnet-5"
+FRED_MODEL = "claude-opus-5-5"
 FRED_VERSION = "fred-v1"
 
 
@@ -1339,6 +1341,7 @@ Brand Partnerships
 ADITYA_FOLLOWUP_PROMPT = """You are Aditya, Creator Manager at an influencer marketing agency in India.
 These creators have not replied to your collaboration pitch. Write a short follow-up email for each.
 The easiest reply to ask for is their rate per collaboration and the kind of brands they like.
+If it fits naturally, remind them that working with us is free: we never charge creators anything.
 Sign off exactly as:
 Aditya
 Creator Manager
@@ -1639,21 +1642,21 @@ def build_offer_terms(amount, deliverables, platform, deadline, revisions, exclu
     if platform:
         lines.append(f"• Platform: {platform}")
     lines.append(f"• Content deadline: {deadline.strftime('%d %b %Y') if deadline else 'to be confirmed with the brief'}")
-    lines.append(f"• Your fee: {format_inr(amount)}")
+    lines.append(f"• Your payout: {format_inr(amount)}")
     payment = f"• Payment: 100% within {payment_days} days after your post is verified live"
     if amount >= advance_min:
-        payment += f" ({advance_pct}% upfront is available on request once the brand confirms)"
+        payment += f" ({advance_pct}% of your payout upfront is available on request once the brand confirms)"
     lines.append(payment)
     if revisions:
         lines.append(f"• Revisions: up to {revisions} round{'s' if revisions > 1 else ''} of changes")
     if exclusivity_days:
         category = (industry or "competing").strip()
         lines.append(f"• Exclusivity: no posts for competing {category} brands for {exclusivity_days} days after publishing")
-    lines.append(f"• Cancellation: if the brand cancels after you've created the content, you receive {kill_fee}% of the fee")
+    lines.append(f"• Cancellation: if the brand cancels after you've created the content, you receive {kill_fee}% of the payout")
     lines.append(f"• This offer is open until {expires_at.astimezone(IST).strftime('%d %b, %I:%M %p')} IST")
     lines += [
         "",
-        'To confirm, just reply "Accept". If you\'d like to discuss the fee or anything else, reply with what works for you.',
+        'To confirm, just reply "Accept". If you\'d like to discuss the payout or anything else, reply with what works for you.',
         "We'll share the brand's name and the full brief as soon as you accept.",
         "",
         "Aditya",
@@ -1674,18 +1677,49 @@ CAMPAIGN
 - Target audience: {target_audience}
 - Location: {location}
 - Requirements: {requirements}
+- Platform(s): {platform}
+- Deliverables from the brief: {deliverables}
 
 For each creator, write ONLY the opening of the offer email:
 - Greet them by first name
 - 2-3 sentences: why they were picked (their content, niche or audience) and a vivid but
   anonymous description of the brand and campaign, e.g. "a Pune-based sportswear brand opening a new store"
 - Under 80 words. Warm and professional.
-- Do NOT mention fees, dates, deliverables, payment or terms. Those are added separately.
+- Describe the brand factually. Never call it leading, top, prominent, famous, premium,
+  or say anything about its size or status that the details above don't state.
+- Do NOT mention fees, dates, payment or terms. Those are added separately.
 - Do NOT sign off.
+- On the LAST line, write the deliverable for THIS creator on THEIR platform, as:
+  DELIVERABLE: <for example: 1 Instagram Reel>
+  Base it on the brief. If the brief is unclear for their platform, use 1 post on their platform.
 
 Return ONLY a JSON array, no other text:
 [{{"offer_id": "OFR_...", "offer_intro": "Hi Ali,\\n\\n..."}}]
 """
+
+
+PLATFORM_NAMES = {"instagram": "Instagram", "youtube": "YouTube", "facebook": "Facebook",
+                  "snapchat": "Snapchat", "linkedin": "LinkedIn", "twitter": "Twitter", "x": "X"}
+
+
+def _creator_platform(creator_platform, campaign_platform):
+    """The platform this creator will post on, nicely capitalized"""
+    if creator_platform and (not campaign_platform or creator_platform.strip().lower() in str(campaign_platform).lower()):
+        return PLATFORM_NAMES.get(creator_platform.strip().lower(), creator_platform.strip().title())
+    return campaign_platform
+
+
+def _split_deliverable(intro: str):
+    """Pull the DELIVERABLE line out of the model's opening"""
+    match = re.search(r"^\s*DELIVERABLE:\s*(.+?)\s*$", intro, flags=re.MULTILINE | re.IGNORECASE)
+    deliverable = match.group(1).strip() if match else None
+    cleaned = re.sub(r"^\s*DELIVERABLE:.*$", "", intro, flags=re.MULTILINE | re.IGNORECASE).strip()
+    return cleaned, deliverable
+
+
+def _first_name(name) -> str:
+    parts = str(name or "").strip().split()
+    return parts[0].capitalize() if parts else "there"
 
 
 def _format_offer_item(i: int, item) -> str:
@@ -1791,6 +1825,7 @@ async def prepare_offers(req: OfferPrepareRequest):
             brand_info=v(campaign["brand_info"]), niche=v(campaign["niche"]),
             target_audience=v(campaign["target_audience"]),
             location=v(campaign["location_requirement"]), requirements=v(campaign["requirements"]),
+            platform=v(campaign["platform"]), deliverables=v(campaign["deliverables"]),
         )
         items = []
         for c in candidates:
@@ -1810,13 +1845,16 @@ async def prepare_offers(req: OfferPrepareRequest):
                     failed.append(c["creator_id"])
                     continue
                 amount = int(c["suggested_payout"] or 0)
+                intro, deliverable = _split_deliverable(intro)
+                deliverable = deliverable or campaign["deliverables"]
+                creator_platform = _creator_platform(c["platform"], campaign["platform"])
                 terms = build_offer_terms(
-                    amount, campaign["deliverables"], campaign["platform"], deadline,
+                    amount, deliverable, creator_platform, deadline,
                     campaign["revisions_allowed"], campaign["exclusivity_days"],
                     campaign["industry"], expires_at, s
                 )
                 body = _strip_brand(intro.strip(), campaign["brand_name"]) + "\n\n" + terms
-                subject = f"Paid collaboration offer for {c['creator_name']}: {format_inr(amount)}"
+                subject = f"Paid collaboration offer for {_first_name(c['creator_name'])}: {format_inr(amount)}"
 
                 rate = campaign["rate_per_collab"] if campaign["pricing_model"] == "per_collab" else None
                 conn.execute(text("""
@@ -1831,7 +1869,7 @@ async def prepare_offers(req: OfferPrepareRequest):
                     "creator_id": c["creator_id"], "match_id": c["match_id"],
                     "amount": amount, "share": rate,
                     "margin": round(1 - amount / rate, 3) if rate else None,
-                    "deliverables": campaign["deliverables"], "deadline": deadline,
+                    "deliverables": deliverable, "deadline": deadline,
                     "exclusivity": campaign["exclusivity_days"],
                     "expires_at": expires_at.replace(tzinfo=None),
                     "subject": subject, "body": body,
@@ -1842,8 +1880,12 @@ async def prepare_offers(req: OfferPrepareRequest):
                     "amount": amount, "subject": subject, "body": body,
                 })
 
+        short_by = open_slots - len(offers)
         return {**base, "status": "success", "count": len(offers), "failed": failed,
-                "needs_more_creators": False, "offers": offers}
+                "needs_more_creators": short_by > 0,
+                "message": (f"{short_by} slot(s) still open with no approved creator. Approve more or rerun Fred."
+                            if short_by > 0 else "All open slots have offers."),
+                "offers": offers}
 
     except HTTPException:
         raise
