@@ -3,7 +3,7 @@ import re
 import uuid
 import json
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Callable
 from types import SimpleNamespace
 from fastapi import FastAPI, HTTPException
@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from anthropic import AsyncAnthropic
 
 # ============ CONFIGURATION ============
@@ -88,14 +88,34 @@ class Creator(Base):
 Base.metadata.create_all(bind=engine)
 
 # ============ PYDANTIC MODELS ============
-class PitchBrandInput(BaseModel):
+class SheetRow(BaseModel):
+    """
+    Base for rows coming from Google Sheets:
+    - blank cells ("") become None
+    - numbers with commas or % ("4,50,000", "4.2%") are cleaned
+    - phone numbers stored as numbers become text
+    """
+    @field_validator("*", mode="before")
+    @classmethod
+    def blank_to_none(cls, value):
+        if isinstance(value, str) and value.strip() == "":
+            return None
+        return value
+
+
+class PitchBrandInput(SheetRow):
     brand_id: str
     brand_name: str
-    industry: str
+    industry: Optional[str] = None
     email: str
     phone: Optional[str] = None
     website: Optional[str] = None
-    basic_info: str
+    basic_info: Optional[str] = None
+
+    @field_validator("phone", mode="before")
+    @classmethod
+    def phone_to_text(cls, value):
+        return None if value is None else str(value).strip()
 
 
 class BatchPitchRequest(BaseModel):
@@ -112,17 +132,30 @@ class BrandResponse(BaseModel):
     status: str
 
 
-class PitchCreatorInput(BaseModel):
+class PitchCreatorInput(SheetRow):
     creator_id: str
     creator_name: str
-    platform: str
-    handle: str
+    platform: Optional[str] = None
+    handle: Optional[str] = None
     email: str
     phone: Optional[str] = None
-    basic_info: str
+    basic_info: Optional[str] = None
     follower_count: Optional[int] = None
     engagement_rate: Optional[float] = None
     comments: Optional[str] = None
+
+    @field_validator("phone", mode="before")
+    @classmethod
+    def phone_to_text(cls, value):
+        return None if value is None else str(value).strip()
+
+    @field_validator("follower_count", "engagement_rate", mode="before")
+    @classmethod
+    def clean_number(cls, value):
+        if isinstance(value, str):
+            cleaned = value.replace(",", "").replace("%", "").strip()
+            return cleaned or None
+        return value
 
 
 class BatchCreatorPitchRequest(BaseModel):
@@ -1564,6 +1597,299 @@ async def daily_digest():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error building digest: {str(e)}")
+
+
+# ============ OFFERS (STAGE 5, PHASE A) ============
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def format_inr(amount) -> str:
+    """Indian number format: 450000 -> ₹4,50,000"""
+    s = str(int(round(float(amount))))
+    if len(s) <= 3:
+        return "₹" + s
+    last3, rest, parts = s[-3:], s[:-3], []
+    while len(rest) > 2:
+        parts.insert(0, rest[-2:])
+        rest = rest[:-2]
+    if rest:
+        parts.insert(0, rest)
+    return "₹" + ",".join(parts) + "," + last3
+
+
+def _strip_brand(text_value: str, brand_name: str) -> str:
+    """Safety net: remove the brand's name from creator-facing text"""
+    if not brand_name or len(brand_name.strip()) < 2:
+        return text_value
+    return re.sub(re.escape(brand_name.strip()), "the brand", text_value, flags=re.IGNORECASE)
+
+
+def build_offer_terms(amount, deliverables, platform, deadline, revisions, exclusivity_days,
+                      industry, expires_at, s: dict) -> str:
+    """The binding part of every offer: always generated from data, never by the model"""
+    payment_days = int(s.get("creator_payment_days", 7))
+    kill_fee = int(float(s.get("kill_fee_pct", 0.5)) * 100)
+    advance_pct = int(float(s.get("creator_advance_pct", 0.3)) * 100)
+    advance_min = float(s.get("creator_advance_min_fee", 25000))
+
+    lines = [
+        "Here are the details:",
+        f"• Deliverables: {deliverables or ('1 post on ' + platform if platform else 'to be confirmed')}",
+    ]
+    if platform:
+        lines.append(f"• Platform: {platform}")
+    lines.append(f"• Content deadline: {deadline.strftime('%d %b %Y') if deadline else 'to be confirmed with the brief'}")
+    lines.append(f"• Your fee: {format_inr(amount)}")
+    payment = f"• Payment: 100% within {payment_days} days after your post is verified live"
+    if amount >= advance_min:
+        payment += f" ({advance_pct}% upfront is available on request once the brand confirms)"
+    lines.append(payment)
+    if revisions:
+        lines.append(f"• Revisions: up to {revisions} round{'s' if revisions > 1 else ''} of changes")
+    if exclusivity_days:
+        category = (industry or "competing").strip()
+        lines.append(f"• Exclusivity: no posts for competing {category} brands for {exclusivity_days} days after publishing")
+    lines.append(f"• Cancellation: if the brand cancels after you've created the content, you receive {kill_fee}% of the fee")
+    lines.append(f"• This offer is open until {expires_at.astimezone(IST).strftime('%d %b, %I:%M %p')} IST")
+    lines += [
+        "",
+        'To confirm, just reply "Accept". If you\'d like to discuss the fee or anything else, reply with what works for you.',
+        "We'll share the brand's name and the full brief as soon as you accept.",
+        "",
+        "Aditya",
+        "Creator Manager",
+    ]
+    return "\n".join(lines)
+
+
+ADITYA_OFFER_PROMPT_TEMPLATE = """You are Aditya, Creator Manager at an influencer marketing agency in India.
+You are sending paid collaboration offers to creators for ONE campaign.
+
+CAMPAIGN
+- Brand name (CONFIDENTIAL): {brand_name}
+  Never mention this name, or any product, store or detail that would reveal it.
+- Industry: {industry}
+- About the brand: {brand_info}
+- Campaign niche: {niche}
+- Target audience: {target_audience}
+- Location: {location}
+- Requirements: {requirements}
+
+For each creator, write ONLY the opening of the offer email:
+- Greet them by first name
+- 2-3 sentences: why they were picked (their content, niche or audience) and a vivid but
+  anonymous description of the brand and campaign, e.g. "a Pune-based sportswear brand opening a new store"
+- Under 80 words. Warm and professional.
+- Do NOT mention fees, dates, deliverables, payment or terms. Those are added separately.
+- Do NOT sign off.
+
+Return ONLY a JSON array, no other text:
+[{{"offer_id": "OFR_...", "offer_intro": "Hi Ali,\\n\\n..."}}]
+"""
+
+
+def _format_offer_item(i: int, item) -> str:
+    return f"""Creator #{i + 1}:
+- ID: {item.offer_id}
+- Name: {item.creator_name}
+- Platform: {item.platform or 'unknown'}
+- Niche: {item.niche or 'unknown'}
+- About: {item.basic_info or 'unknown'}"""
+
+
+class OfferPrepareRequest(BaseModel):
+    campaign_id: str
+
+
+@app.post("/offers/prepare")
+async def prepare_offers(req: OfferPrepareRequest):
+    """
+    Create offers for approved creators who don't have one yet, up to the open slots.
+    Aditya writes a personal opening; fees and terms come from data.
+    Returns emails ready for N8N to send.
+    """
+    try:
+        s = load_settings()
+
+        with engine.begin() as conn:
+            campaign = conn.execute(text("""
+                SELECT c.*, b.brand_name, b.industry, b.basic_info AS brand_info
+                FROM campaigns c JOIN brands b ON b.brand_id = c.brand_id
+                WHERE c.campaign_id = :cid
+            """), {"cid": req.campaign_id}).mappings().first()
+            if not campaign:
+                raise HTTPException(status_code=404, detail="Campaign not found")
+            campaign = dict(campaign)
+
+            # Unsent drafts from an earlier failed run are rebuilt from scratch
+            conn.execute(text("DELETE FROM offers WHERE campaign_id = :cid AND status = 'draft'"),
+                         {"cid": req.campaign_id})
+
+            approved_count = conn.execute(text("""
+                SELECT COUNT(*) FROM matches WHERE campaign_id = :cid AND approval_status = 'approved'
+            """), {"cid": req.campaign_id}).scalar() or 0
+
+            # How many creators this campaign needs
+            if campaign["pricing_model"] == "per_collab":
+                target = campaign["slots"] or 1
+            else:
+                target = approved_count
+
+            in_play = conn.execute(text("""
+                SELECT COUNT(DISTINCT creator_id) FROM offers
+                WHERE campaign_id = :cid AND status IN ('sent', 'accepted', 'countered')
+            """), {"cid": req.campaign_id}).scalar() or 0
+            open_slots = max(target - in_play, 0)
+
+            candidates = [dict(r) for r in conn.execute(text("""
+                SELECT m.id AS match_id, m.rank, m.suggested_payout,
+                       cr.creator_id, cr.creator_name, cr.email, cr.platform, cr.niche, cr.basic_info
+                FROM matches m JOIN creators cr ON cr.creator_id = m.creator_id
+                WHERE m.campaign_id = :cid
+                  AND m.approval_status = 'approved'
+                  AND NOT EXISTS (SELECT 1 FROM offers o WHERE o.campaign_id = m.campaign_id
+                                  AND o.creator_id = m.creator_id)
+                  AND COALESCE(cr.email, '') <> ''
+                  AND COALESCE(cr.unsubscribed, FALSE) = FALSE
+                ORDER BY m.rank
+                LIMIT :lim
+            """), {"cid": req.campaign_id, "lim": open_slots}).mappings().all()]
+
+        base = {
+            "campaign_id": req.campaign_id,
+            "target_creators": target,
+            "offers_in_play": in_play,
+            "open_slots": open_slots,
+        }
+        if not candidates:
+            spare_needed = open_slots > 0
+            return {**base, "status": "success", "count": 0, "offers": [],
+                    "needs_more_creators": spare_needed,
+                    "message": ("No approved creators left to offer. Approve more or rerun Fred."
+                                if spare_needed else "All slots already have offers.")}
+
+        # Offer terms shared by every creator in this campaign
+        timeline = campaign["timeline_days"]
+        short = timeline is not None and timeline <= int(s.get("short_timeline_days", 7))
+        expiry_hours = int(s.get("offer_expiry_hours_short", 24) if short else s.get("offer_expiry_hours", 48))
+        now = datetime.utcnow().replace(tzinfo=timezone.utc)
+        expires_at = now + timedelta(hours=expiry_hours)
+
+        if campaign["deadline"]:
+            deadline = campaign["deadline"]
+        elif timeline:
+            deadline = (campaign["created_at"] + timedelta(days=timeline)).date()
+        else:
+            deadline = None
+
+        # Aditya writes the personal openings (parallel batches, retries, brand name kept out)
+        def v(x):
+            return x if x not in (None, "") else "not specified"
+
+        prompt = ADITYA_OFFER_PROMPT_TEMPLATE.format(
+            brand_name=campaign["brand_name"], industry=v(campaign["industry"]),
+            brand_info=v(campaign["brand_info"]), niche=v(campaign["niche"]),
+            target_audience=v(campaign["target_audience"]),
+            location=v(campaign["location_requirement"]), requirements=v(campaign["requirements"]),
+        )
+        items = []
+        for c in candidates:
+            c["offer_id"] = f"OFR_{req.campaign_id}_{c['creator_id']}_R1"
+            items.append(SimpleNamespace(**c))
+
+        intros = await generate_pitches_parallel(
+            items, "offer_id", _format_offer_item, prompt, "creators",
+            text_key="offer_intro", task="offer email openings"
+        )
+
+        offers, failed = [], []
+        with engine.begin() as conn:
+            for c in candidates:
+                intro = intros.get(c["offer_id"])
+                if not intro:
+                    failed.append(c["creator_id"])
+                    continue
+                amount = int(c["suggested_payout"] or 0)
+                terms = build_offer_terms(
+                    amount, campaign["deliverables"], campaign["platform"], deadline,
+                    campaign["revisions_allowed"], campaign["exclusivity_days"],
+                    campaign["industry"], expires_at, s
+                )
+                body = _strip_brand(intro.strip(), campaign["brand_name"]) + "\n\n" + terms
+                subject = f"Paid collaboration offer for {c['creator_name']}: {format_inr(amount)}"
+
+                rate = campaign["rate_per_collab"] if campaign["pricing_model"] == "per_collab" else None
+                conn.execute(text("""
+                    INSERT INTO offers (offer_id, campaign_id, creator_id, match_id, round,
+                        offered_amount, brand_price_share, margin_pct, deliverables, deadline,
+                        exclusivity_days, status, expires_at, subject, body)
+                    VALUES (:offer_id, :campaign_id, :creator_id, :match_id, 1,
+                        :amount, :share, :margin, :deliverables, :deadline,
+                        :exclusivity, 'draft', :expires_at, :subject, :body)
+                """), {
+                    "offer_id": c["offer_id"], "campaign_id": req.campaign_id,
+                    "creator_id": c["creator_id"], "match_id": c["match_id"],
+                    "amount": amount, "share": rate,
+                    "margin": round(1 - amount / rate, 3) if rate else None,
+                    "deliverables": campaign["deliverables"], "deadline": deadline,
+                    "exclusivity": campaign["exclusivity_days"],
+                    "expires_at": expires_at.replace(tzinfo=None),
+                    "subject": subject, "body": body,
+                })
+                offers.append({
+                    "offer_id": c["offer_id"], "creator_id": c["creator_id"],
+                    "creator_name": c["creator_name"], "email": c["email"],
+                    "amount": amount, "subject": subject, "body": body,
+                })
+
+        return {**base, "status": "success", "count": len(offers), "failed": failed,
+                "needs_more_creators": False, "offers": offers}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error preparing offers: {str(e)}")
+
+
+class OfferSentRequest(BaseModel):
+    offer_id: str
+    gmail_message_id: Optional[str] = None
+    gmail_thread_id: Optional[str] = None
+
+
+@app.post("/offers/mark-sent")
+async def mark_offer_sent(req: OfferSentRequest):
+    """Record that an offer email went out, and move the campaign to offers_sent"""
+    try:
+        with engine.begin() as conn:
+            offer = conn.execute(text("""
+                UPDATE offers SET status = 'sent', sent_at = NOW(),
+                       gmail_message_id = :msg, gmail_thread_id = :thread
+                WHERE offer_id = :oid
+                RETURNING campaign_id, creator_id, subject, body
+            """), {"oid": req.offer_id, "msg": req.gmail_message_id,
+                   "thread": req.gmail_thread_id}).mappings().first()
+            if not offer:
+                raise HTTPException(status_code=404, detail="Offer not found")
+
+            conn.execute(text("""
+                UPDATE campaigns SET status = 'offers_sent'
+                WHERE campaign_id = :cid AND status IN ('brief_received', 'matching', 'awaiting_approval')
+            """), {"cid": offer["campaign_id"]})
+
+            conn.execute(text("""
+                INSERT INTO conversations (contact_type, contact_id, gmail_thread_id, gmail_message_id,
+                                           direction, subject, body, intent)
+                VALUES ('creator', :cid, :thread, :msg, 'outbound', :subject, :body, 'offer')
+                ON CONFLICT (gmail_message_id) DO NOTHING
+            """), {"cid": offer["creator_id"], "thread": req.gmail_thread_id, "msg": req.gmail_message_id,
+                   "subject": offer["subject"], "body": offer["body"]})
+
+        return {"status": "success", "offer_id": req.offer_id, "campaign_id": offer["campaign_id"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error marking offer sent: {str(e)}")
 
 
 # ============ BRANDS CRUD ============
