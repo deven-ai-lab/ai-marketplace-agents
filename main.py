@@ -29,7 +29,7 @@ MAX_TOKENS = 16000                # Room for adaptive thinking + emails
 # ============ APP SETUP ============
 app = FastAPI(
     title="AI Marketplace Agents",
-    description="Steve (Brand Manager), Fred (Matcher), Aditya (Creator Manager)",
+    description="Ananya (Brand Partnerships, internally 'steve'), Fred (Matcher), Aditya (Creator Manager)",
     version="1.1.0"
 )
 
@@ -350,7 +350,7 @@ async def health_check():
 
 
 # ============ STEVE: BRAND MANAGER AGENT ============
-STEVE_SYSTEM_PROMPT = """You are Steve, the Brand Manager Agent for an AI-powered influencer marketing agency.
+STEVE_SYSTEM_PROMPT = """You are Ananya, the Brand Partnerships Manager at an influencer marketing agency in India.
 
 Your role: Generate compelling pitch emails to brands interested in creator partnerships.
 
@@ -368,6 +368,9 @@ Email must be:
 - Concise (under 200 words)
 - Personalized to their industry
 - Include a clear call-to-action
+- Sign off exactly as:
+  Ananya
+  Brand Partnerships
 
 CRITICAL REQUIREMENT: Return exactly as many pitch emails as brands provided. Do NOT skip anyone.
 
@@ -582,7 +585,7 @@ Only extract what the reply actually says. Use null for anything not stated.
 Return ONLY a valid JSON object. No preamble, no markdown.
 """
 
-STEVE_PARSE_PROMPT = """You are Steve, Brand Manager Agent at an influencer marketing agency.
+STEVE_PARSE_PROMPT = """You are Ananya, Brand Partnerships Manager at an influencer marketing agency.
 You sent a pitch email to a brand and they replied. Read the reply and extract structured data.
 """ + REPLY_RULES + """
 PRICING MODEL:
@@ -1343,10 +1346,10 @@ Return ONLY a JSON array, no other text:
 [{"contact_id": "ID_001", "followup_email": "Hi ...,\\n\\n...\\n\\n<sign-off>"}]
 """
 
-STEVE_FOLLOWUP_PROMPT = """You are Steve, Brand Manager at an influencer marketing agency in India.
+STEVE_FOLLOWUP_PROMPT = """You are Ananya, Brand Partnerships Manager at an influencer marketing agency in India.
 These brands have not replied to your partnership pitch. Write a short follow-up email for each.
 Sign off exactly as:
-Steve
+Ananya
 Brand Partnerships
 """ + FOLLOWUP_RULES
 
@@ -1667,7 +1670,7 @@ def build_offer_terms(amount, deliverables, platform, deadline, revisions, exclu
     if exclusivity_days:
         category = (industry or "competing").strip()
         lines.append(f"• Exclusivity: no posts for competing {category} brands for {exclusivity_days} days after publishing")
-    lines.append(f"• Cancellation: if the brand cancels after you've created the content, you receive {kill_fee}% of the payout in total")
+    lines.append(f"• Cancellation: if the brand cancels for its own reasons after you've created content that meets the brief, you receive {kill_fee}% of the payout in total. If the content doesn't meet the brief after the agreed revisions, no payment is due")
     lines.append(f"• This offer is open until {expires_at.astimezone(IST).strftime('%d %b, %I:%M %p')} IST")
     lines += [
         "",
