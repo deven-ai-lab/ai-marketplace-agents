@@ -560,6 +560,27 @@ def parse_json_object(response_text: str) -> dict:
         raise
 
 
+def to_days(value):
+    """Turn a timeline into days: 14, "14", "14 days", "2 weeks", "1 month", "a week" -> int, else None"""
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value) if value > 0 else None
+    t = str(value).strip().lower()
+    per_unit = {"day": 1, "week": 7, "month": 30}
+    # Digits, with an optional unit: "14", "14 days", "2 weeks", "3.5 weeks"
+    match = re.search(r"\b(\d+(?:\.\d+)?)\s*(day|week|month)?", t)
+    if match:
+        days = float(match.group(1)) * per_unit[match.group(2) or "day"]
+        return int(round(days)) if days > 0 else None
+    # Words only count WITH a unit: "a week", "two weeks" (so "asap" stays empty)
+    words = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+    match = re.search(r"\b(a|an|one|two|three|four|five|six)\s+(day|week|month)s?\b", t)
+    if match:
+        return int(words[match.group(1)] * per_unit[match.group(2)])
+    return None
+
+
 def to_int_or_none(value):
     try:
         return int(float(value)) if value not in (None, "") else None
@@ -593,6 +614,11 @@ PRICING MODEL:
 - "per_collab": the brand gives a rate PER creator or PER collaboration (e.g. "20k per collab", "15k per reel")
 - null: no budget mentioned
 Put a total budget in total_budget. Put a per-creator rate in rate_per_collab, and the number of creators wanted in slots.
+
+TIMELINE:
+- timeline_days is the number of days until the content should be live, as an integer.
+- Convert: "2 weeks" = 14, "10 days" = 10, "1 month" = 30, "next week" = 7.
+- If they give a specific date instead, put null here and mention the date in "notes".
 
 Format:
 {
@@ -693,7 +719,7 @@ async def steve_parse_reply(request: ParseReplyRequest):
             "target_audience": clean_text(parsed.get("target_audience")),
             "location_requirement": clean_text(parsed.get("location_requirement")),
             "deliverables": clean_text(parsed.get("deliverables")),
-            "timeline_days": to_int_or_none(parsed.get("timeline_days")),
+            "timeline_days": to_days(parsed.get("timeline_days")),
             "requirements": clean_text(parsed.get("requirements")),
         }
 
@@ -2789,6 +2815,47 @@ Brand Partnerships"""
         raise HTTPException(status_code=500, detail=f"Error handling lineup reply: {str(e)}")
 
 
+CREATOR_POINTERS_PROMPT = """You are Aditya, Creator Manager at an influencer marketing agency in India.
+A brand has just confirmed a campaign. Write 2 short, practical pointers that help the creators
+start planning their content before the full brief arrives.
+
+Rules:
+- Base them ONLY on the campaign details given. Never invent products, offers, discounts, prices,
+  store details or claims about the brand.
+- Each pointer under 25 words, specific to this campaign (audience, location, content angle).
+- Do not mention ad disclosure, payment or deadlines. Those are covered separately.
+
+Return ONLY a JSON object, no other text:
+{"pointers": ["...", "..."]}
+"""
+
+AD_DISCLOSURE_POINTER = ("Mark the post clearly as a paid partnership: use the platform's paid-partnership "
+                         "label, or #ad / #collab in the caption, as required by ASCI guidelines.")
+
+
+async def write_content_pointers(campaign: dict) -> list:
+    """2 campaign-specific content pointers. Returns [] if anything goes wrong, so the email still sends."""
+    def v(x):
+        return x if x not in (None, "") else "not specified"
+    try:
+        parsed = parse_json_object(await call_claude(CREATOR_POINTERS_PROMPT, f"""CAMPAIGN
+Brand: {campaign.get('brand_name')} (industry: {v(campaign.get('industry'))})
+About the brand: {v(campaign.get('brand_info'))}
+Platform: {v(campaign.get('platform'))}
+Niche: {v(campaign.get('niche'))}
+Target audience: {v(campaign.get('target_audience'))}
+Location: {v(campaign.get('location_requirement'))}
+Deliverables: {v(campaign.get('deliverables'))}
+Requirements: {v(campaign.get('requirements'))}
+
+Return ONLY the JSON object."""))
+        pointers = [str(p).strip() for p in (parsed.get("pointers") or []) if str(p).strip()]
+        return pointers[:2]
+    except Exception as e:
+        print(f"Content pointers failed for {campaign.get('brand_name')}: {e}")
+        return []
+
+
 class PaymentReceivedRequest(BaseModel):
     campaign_id: str
 
@@ -2798,6 +2865,18 @@ async def payment_received(req: PaymentReceivedRequest):
     """Advance received: reveal creators to the brand and tell each creator the campaign is on"""
     try:
         s = load_settings()
+
+        # Content pointers are written first, so no database transaction waits on the AI call
+        with engine.connect() as conn:
+            pre = conn.execute(text("""
+                SELECT c.status, c.niche, c.target_audience, c.location_requirement, c.deliverables,
+                       c.requirements, c.platform, b.brand_name, b.industry, b.basic_info AS brand_info
+                FROM campaigns c JOIN brands b ON b.brand_id = c.brand_id
+                WHERE c.campaign_id = :cid
+            """), {"cid": req.campaign_id}).mappings().first()
+        pointers = await write_content_pointers(dict(pre)) if pre and pre["status"] == "confirmed" else []
+        pointer_block = "\n".join(f"• {p}" for p in pointers + [AD_DISCLOSURE_POINTER])
+
         with engine.begin() as conn:
             c = conn.execute(text("""
                 SELECT c.*, b.brand_name FROM campaigns c JOIN brands b ON b.brand_id = c.brand_id
@@ -2816,7 +2895,8 @@ async def payment_received(req: PaymentReceivedRequest):
             """), {"cid": req.campaign_id})
 
             creators = [dict(r) for r in conn.execute(text("""
-                SELECT o.offer_id, o.deliverables, o.deadline, o.gmail_thread_id, o.gmail_message_id AS offer_msg,
+                SELECT o.offer_id, o.creator_id, o.deliverables, o.deadline, o.gmail_thread_id,
+                       o.gmail_message_id AS offer_msg,
                        COALESCE(o.final_amount, o.offered_amount) AS payout,
                        cr.creator_name, cr.handle, cr.platform
                 FROM offers o
@@ -2836,13 +2916,37 @@ async def payment_received(req: PaymentReceivedRequest):
             brand = c["brand_name"]
             deal_value = c["final_brand_price"] or 0
             script_step = deal_value >= float(s.get("small_deal_threshold_inr", 25000))
+            if c["deadline"]:
+                campaign_deadline = c["deadline"]
+            elif c["timeline_days"]:
+                campaign_deadline = (c["created_at"] + timedelta(days=c["timeline_days"])).date()
+            else:
+                campaign_deadline = None
+
             for cr in creators:
+                # Find something in this negotiation to reply to, from most to least specific:
+                # 1. the creator's latest reply in the offer thread   2. this round's offer email
+                # 3. any earlier round's offer email                  4. the creator's latest message anywhere
                 reply_to = conn.execute(text("""
                     SELECT gmail_message_id FROM conversations
-                    WHERE gmail_thread_id = :t AND direction = 'inbound'
+                    WHERE gmail_thread_id = :t AND direction = 'inbound' AND gmail_message_id IS NOT NULL
                     ORDER BY created_at DESC LIMIT 1
-                """), {"t": cr["gmail_thread_id"]}).scalar() or cr["offer_msg"]
-                deadline = cr["deadline"]
+                """), {"t": cr["gmail_thread_id"]}).scalar() if cr["gmail_thread_id"] else None
+                reply_to = reply_to or cr["offer_msg"]
+                if not reply_to:
+                    reply_to = conn.execute(text("""
+                        SELECT gmail_message_id FROM offers
+                        WHERE campaign_id = :cid AND creator_id = :crid AND gmail_message_id IS NOT NULL
+                        ORDER BY round DESC LIMIT 1
+                    """), {"cid": req.campaign_id, "crid": cr["creator_id"]}).scalar()
+                if not reply_to:
+                    reply_to = conn.execute(text("""
+                        SELECT gmail_message_id FROM conversations
+                        WHERE contact_type = 'creator' AND contact_id = :crid
+                          AND direction = 'inbound' AND gmail_message_id IS NOT NULL
+                        ORDER BY created_at DESC LIMIT 1
+                    """), {"crid": cr["creator_id"]}).scalar()
+                deadline = cr["deadline"] or campaign_deadline
                 steps = "Next, we'll send you the full brief."
                 if script_step:
                     steps += " Before shooting, you'll share a short script or concept so the brand can approve the direction."
@@ -2859,6 +2963,9 @@ Quick recap:
 • Content deadline: {deadline.strftime('%d %b %Y') if deadline else 'to be confirmed with the brief'}
 • Your payout: {format_inr(cr['payout'])}
 • Payment: {creator_payment_terms(cr['payout'], s)}
+
+A few pointers as you start planning:
+{pointer_block}
 
 {steps}
 
