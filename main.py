@@ -2628,6 +2628,287 @@ async def mark_lineup_sent(req: LineupSentRequest):
         raise HTTPException(status_code=500, detail=f"Error marking lineup sent: {str(e)}")
 
 
+# ============ BRAND CONFIRMATION + PAYMENT (STAGE 6, PHASE B) ============
+PAYMENT_DETAILS = os.getenv("PAYMENT_DETAILS", "").replace("\\n", "\n").strip()
+
+LINEUP_REPLY_PROMPT = """You are Ananya, Brand Partnerships Manager at an influencer marketing agency in India.
+You sent a brand an anonymized creator lineup (Creator A, Creator B, ...) with a price. Classify their reply.
+
+INTENT (pick exactly one):
+- "confirm": clearly confirms or approves the lineup, with no conditions
+- "payment_sent": says they have paid or transferred the advance
+- "reject_creators": wants to remove or swap one or more specific creators
+- "decline": does not want to go ahead with the campaign at all
+- "question": asks something, or adds conditions, without clearly confirming
+- "auto_reply": out-of-office or automated message
+
+rejected_labels: for reject_creators, the creator labels they want removed, e.g. ["Creator B"]. Else [].
+
+Return ONLY a JSON object, no other text:
+{"intent": "confirm", "rejected_labels": [], "reason": "their reason if they reject or decline, else null",
+ "questions": ["any questions they asked"], "summary": "one sentence for the founder"}
+"""
+
+LINEUP_INTENTS = {"confirm", "payment_sent", "reject_creators", "decline", "question", "auto_reply"}
+
+
+def _profile_link(platform, handle):
+    h = str(handle or "").strip().lstrip("@")
+    if not h:
+        return None
+    p = str(platform or "").strip().lower()
+    if p == "instagram":
+        return f"https://www.instagram.com/{h}"
+    if p == "youtube":
+        return f"https://www.youtube.com/@{h}"
+    return None
+
+
+class LineupReplyRequest(BaseModel):
+    campaign_id: str
+    gmail_message_id: str
+    gmail_thread_id: Optional[str] = None
+    from_email: Optional[str] = None
+    reply_subject: Optional[str] = None
+    reply_body: str
+
+
+@app.post("/lineup/parse-reply")
+async def parse_lineup_reply(req: LineupReplyRequest):
+    """Understand a brand's reply to the lineup and decide the next step"""
+    try:
+        s = load_settings()
+        with engine.connect() as conn:
+            if conn.execute(text("SELECT 1 FROM conversations WHERE gmail_message_id = :m"),
+                            {"m": req.gmail_message_id}).first():
+                return {"status": "success", "action": "duplicate", "campaign_id": req.campaign_id,
+                        "reply_email": None, "start_payment_wait": False,
+                        "slack_replies_text": None, "slack_approvals_text": None}
+            c = conn.execute(text("""
+                SELECT c.*, b.brand_name FROM campaigns c JOIN brands b ON b.brand_id = c.brand_id
+                WHERE c.campaign_id = :cid
+            """), {"cid": req.campaign_id}).mappings().first()
+        if not c:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        c = dict(c)
+        brand = c["brand_name"]
+
+        parsed = parse_json_object(await call_claude(
+            LINEUP_REPLY_PROMPT,
+            f"BRAND: {brand}\n\nTHEIR REPLY:\n{strip_quoted_reply(req.reply_body)}\n\nReturn ONLY the JSON object."
+        ))
+        intent = str(parsed.get("intent", "question")).strip().lower()
+        if intent not in LINEUP_INTENTS:
+            intent = "question"
+        summary = parsed.get("summary") or ""
+        questions = parsed.get("questions") or []
+        reason = clean_text(parsed.get("reason"))
+
+        result = {"status": "success", "campaign_id": req.campaign_id, "intent": intent, "summary": summary,
+                  "reply_email": None, "start_payment_wait": False, "payment_prompt": None,
+                  "slack_replies_text": None, "slack_approvals_text": None}
+        action = intent
+
+        # Confirming only counts while the lineup is open
+        if intent == "confirm" and c["status"] != "shortlist_sent":
+            action = "question" if c["status"] != "confirmed" else "note"
+
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO conversations (contact_type, contact_id, gmail_thread_id, gmail_message_id,
+                                           direction, from_email, subject, body, intent, extracted_data)
+                VALUES ('brand', :bid, :thread, :msg, 'inbound', :from_email, :subject, :body,
+                        :intent, CAST(:data AS JSONB))
+                ON CONFLICT (gmail_message_id) DO NOTHING
+            """), {"bid": c["brand_id"], "thread": req.gmail_thread_id, "msg": req.gmail_message_id,
+                   "from_email": req.from_email, "subject": req.reply_subject, "body": req.reply_body,
+                   "intent": f"lineup_{intent}", "data": json.dumps(parsed)})
+
+            if action == "confirm":
+                conn.execute(text("UPDATE campaigns SET status = 'confirmed' WHERE campaign_id = :cid"),
+                             {"cid": req.campaign_id})
+                advance = c["advance_amount"] or 0
+                registered = float(s.get("gst_registered", 0)) >= 1
+                gst_on_advance = int(round(advance * float(s.get("gst_rate", 0.18)))) if registered else 0
+                amount_line = (f"{format_inr(advance)} + GST ({format_inr(gst_on_advance)}) = {format_inr(advance + gst_on_advance)}"
+                               if registered else format_inr(advance))
+                balance = (c["final_brand_price"] or 0) - advance
+                balance_line = format_inr(balance) + (" + GST" if registered else "")
+                pct = int(float(s.get("advance_pct", 0.7)) * 100)
+                result["payment_prompt"] = (f"💰 *{brand} confirmed the lineup!* Waiting for the {pct}% advance of "
+                                            f"*{amount_line}*.\nTap the button once it's in your account.")
+                if PAYMENT_DETAILS:
+                    result["reply_email"] = f"""Hi {brand} team,
+
+Thank you for confirming! 🎉
+
+To lock in the lineup, please transfer the {pct}% advance:
+Amount: {amount_line}
+
+{PAYMENT_DETAILS}
+
+Please reply to this email once the transfer is done. As soon as we receive it, we'll share each creator's name and profile with you and send them the full brief.
+
+The remaining {100 - pct}% ({balance_line}) is due before the content goes live.
+
+Ananya
+Brand Partnerships"""
+                    result["start_payment_wait"] = True
+                    result["slack_replies_text"] = f"🎉 *{brand}* confirmed the lineup. Advance request sent ({amount_line})."
+                else:
+                    result["slack_approvals_text"] = (f"⚠️ *{brand}* confirmed the lineup, but PAYMENT_DETAILS isn't set on "
+                                                      f"Railway, so no advance request was sent. Add it, then send the request manually.")
+
+            elif action == "payment_sent":
+                result["slack_approvals_text"] = (f"💸 *{brand}* says the advance has been sent. Check your account, "
+                                                  f"then tap *Payment received* on the waiting message.")
+                result["slack_replies_text"] = f"💸 *{brand}*: {summary}"
+
+            elif action in ("reject_creators", "decline"):
+                what = ("wants to swap " + ", ".join(parsed.get("rejected_labels") or ["a creator"])
+                        if action == "reject_creators" else "doesn't want to go ahead")
+                why = f" Reason: {reason}" if reason else ""
+                result["slack_approvals_text"] = (f"🔁 *{brand}* {what}.{why}\nReply to them in Gmail for now; "
+                                                  f"the automated flow for this comes in Phase C.")
+                result["slack_replies_text"] = f"🔁 *{brand}*: {summary}"
+
+            elif action == "question":
+                result["slack_approvals_text"] = (f"❓ *{brand}* has a question about the lineup:\n"
+                                                  + ("\n".join(f"• {q}" for q in questions) if questions else f"• {summary}")
+                                                  + "\nReply to them in Gmail in the same thread.")
+                result["slack_replies_text"] = f"❓ *{brand}* asked about the lineup: {summary}"
+
+            elif action == "note":
+                result["slack_replies_text"] = f"💬 *{brand}* wrote again about the confirmed lineup: {summary}"
+
+        result["action"] = action
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error handling lineup reply: {str(e)}")
+
+
+class PaymentReceivedRequest(BaseModel):
+    campaign_id: str
+
+
+@app.post("/lineup/payment-received")
+async def payment_received(req: PaymentReceivedRequest):
+    """Advance received: reveal creators to the brand and tell each creator the campaign is on"""
+    try:
+        s = load_settings()
+        with engine.begin() as conn:
+            c = conn.execute(text("""
+                SELECT c.*, b.brand_name FROM campaigns c JOIN brands b ON b.brand_id = c.brand_id
+                WHERE c.campaign_id = :cid
+            """), {"cid": req.campaign_id}).mappings().first()
+            if not c:
+                raise HTTPException(status_code=404, detail="Campaign not found")
+            c = dict(c)
+            if c["status"] != "confirmed":
+                return {"status": "skipped", "campaign_id": req.campaign_id, "brand_email": None,
+                        "creator_emails": [], "slack_text": f"ℹ️ `{req.campaign_id}` is `{c['status']}`, so nothing was changed."}
+
+            conn.execute(text("""
+                UPDATE campaigns SET status = 'in_production', advance_received_at = NOW()
+                WHERE campaign_id = :cid
+            """), {"cid": req.campaign_id})
+
+            creators = [dict(r) for r in conn.execute(text("""
+                SELECT o.offer_id, o.deliverables, o.deadline, o.gmail_thread_id, o.gmail_message_id AS offer_msg,
+                       COALESCE(o.final_amount, o.offered_amount) AS payout,
+                       cr.creator_name, cr.handle, cr.platform
+                FROM offers o
+                JOIN creators cr ON cr.creator_id = o.creator_id
+                LEFT JOIN matches m ON m.id = o.match_id
+                WHERE o.campaign_id = :cid AND o.status = 'accepted'
+                ORDER BY m.rank NULLS LAST, o.offer_id
+            """), {"cid": req.campaign_id}).mappings().all()]
+
+            brand_reply_to = conn.execute(text("""
+                SELECT gmail_message_id FROM conversations
+                WHERE gmail_thread_id = :t AND direction = 'inbound' AND contact_type = 'brand'
+                ORDER BY created_at DESC LIMIT 1
+            """), {"t": c["gmail_thread_id"]}).scalar()
+
+            creator_emails = []
+            brand = c["brand_name"]
+            deal_value = c["final_brand_price"] or 0
+            script_step = deal_value >= float(s.get("small_deal_threshold_inr", 25000))
+            for cr in creators:
+                reply_to = conn.execute(text("""
+                    SELECT gmail_message_id FROM conversations
+                    WHERE gmail_thread_id = :t AND direction = 'inbound'
+                    ORDER BY created_at DESC LIMIT 1
+                """), {"t": cr["gmail_thread_id"]}).scalar() or cr["offer_msg"]
+                deadline = cr["deadline"]
+                steps = "Next, we'll send you the full brief."
+                if script_step:
+                    steps += " Before shooting, you'll share a short script or concept so the brand can approve the direction."
+                creator_emails.append({
+                    "offer_id": cr["offer_id"],
+                    "creator_name": cr["creator_name"],
+                    "reply_to_message_id": reply_to,
+                    "body": f"""Hi {_first_name(cr['creator_name'])},
+
+Great news: {brand} has confirmed the campaign, so you're officially on! 🎉
+
+Quick recap:
+• Deliverables: {cr['deliverables'] or 'as per the brief'}
+• Content deadline: {deadline.strftime('%d %b %Y') if deadline else 'to be confirmed with the brief'}
+• Your payout: {format_inr(cr['payout'])}
+• Payment: {creator_payment_terms(cr['payout'], s)}
+
+{steps}
+
+Aditya
+Creator Manager""",
+                })
+
+        # Name reveal for the brand
+        lines = []
+        for i, cr in enumerate(creators):
+            link = _profile_link(cr["platform"], cr["handle"])
+            platform = PLATFORM_NAMES.get(str(cr["platform"] or "").lower(), cr["platform"])
+            lines.append(f"Creator {chr(65 + i)}: {cr['creator_name']} ({cr['handle']}) · {platform}"
+                         + (f"\n{link}" if link else "")
+                         + f"\nDeliverable: {cr['deliverables'] or 'as per the brief'}")
+        next_steps = ["We're sending each creator the full brief next."]
+        if script_step:
+            next_steps.append("Each creator will share a script or concept for your approval before shooting.")
+        rev = c["revisions_allowed"]
+        next_steps.append("You approve the final content before it goes live"
+                          + (f" (up to {rev} round{'s' if rev and rev > 1 else ''} of revisions)." if rev else "."))
+        numbered = "\n".join(f"{i}. {x}" for i, x in enumerate(next_steps, start=1))
+
+        brand_email = f"""Hi {brand} team,
+
+Payment received, thank you! Here's your confirmed creator lineup:
+
+""" + "\n\n".join(lines) + f"""
+
+What happens next:
+{numbered}
+
+Ananya
+Brand Partnerships"""
+
+        return {
+            "status": "success",
+            "campaign_id": req.campaign_id,
+            "brand_reply_to_message_id": brand_reply_to,
+            "brand_email": brand_email,
+            "creator_emails": creator_emails,
+            "slack_text": (f"✅ Advance received for *{brand}*. Creator names sent to the brand, and "
+                           f"{len(creator_emails)} creator(s) told they're confirmed. Campaign is now in production."),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error recording payment: {str(e)}")
+
+
 # ============ BRANDS CRUD ============
 @app.post("/brands")
 async def create_brand(brand: dict):
