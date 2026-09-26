@@ -2548,9 +2548,10 @@ async def prepare_lineup(req: LineupRequest):
             else:
                 deadline = None
 
-            # Anonymized creator blocks
-            blocks = []
+            # Anonymized creator blocks; the label -> offer mapping is saved so replies hit the right creator
+            blocks, labels = [], {}
             for i, cr in enumerate(creators):
+                labels[f"Creator {chr(65 + i)}"] = cr["offer_id"]
                 facts = " · ".join(x for x in [
                     PLATFORM_NAMES.get(str(cr["platform"] or "").lower(), cr["platform"]),
                     f"{_format_followers(cr['follower_count'])} followers" if cr["follower_count"] else None,
@@ -2578,7 +2579,7 @@ async def prepare_lineup(req: LineupRequest):
             n = len(creators)
             body = f"""Hi {c['brand_name']} team,
 
-Your creator lineup is ready. All {n} creator{'s have' if n > 1 else ' has'} already accepted, so the campaign can start as soon as you confirm.
+{"Here's your updated creator lineup." if c["lineup_sent_at"] else "Your creator lineup is ready."} All {n} creator{'s have' if n > 1 else ' has'} already accepted, so the campaign can start as soon as you confirm.
 
 YOUR LINEUP
 
@@ -2598,10 +2599,13 @@ Brand Partnerships"""
 
             conn.execute(text("""
                 UPDATE campaigns SET lineup_email = :body, final_brand_price = :price,
-                       gst_amount = :gst, advance_amount = :advance, lineup_expires_at = :expires
+                       gst_amount = :gst, advance_amount = :advance, lineup_expires_at = :expires,
+                       lineup_labels = CAST(:labels AS JSONB),
+                       lineup_reminder_sent_at = NULL, lineup_deadline_alerted_at = NULL
                 WHERE campaign_id = :cid
             """), {"body": body, "price": price, "gst": p["gst"], "advance": p["advance"],
-                   "expires": expires_at.replace(tzinfo=None), "cid": req.campaign_id})
+                   "expires": expires_at.replace(tzinfo=None), "labels": json.dumps(labels),
+                   "cid": req.campaign_id})
 
         return {
             "status": "success",
@@ -2690,6 +2694,64 @@ def _profile_link(platform, handle):
     return None
 
 
+REJECTION_DRAFT_PROMPT = """You are Ananya, Brand Partnerships Manager at an influencer marketing agency in India.
+A brand reviewed an anonymized creator lineup and wants to remove one or more creators. Write a short reply email.
+
+Tone: curious and helpful, never defensive or pushy.
+- Thank them for reviewing the lineup and say you're happy to adjust.
+- For each creator they removed, give one or two sentences on why we picked them, using ONLY the facts provided.
+- If they gave a reason, address it directly. Do NOT ask them why again.
+- If they gave no reason, ask what they're looking for instead (audience, content style, follower range).
+- Refer to creators only by their label (Creator A, Creator B). Never use names or handles.
+- Never invent numbers, results or facts.
+- Under 150 words. Sign off exactly as:
+Ananya
+Brand Partnerships
+
+Return ONLY the email text, starting with "Hi"."""
+
+
+def _match_labels(requested, labels: dict) -> list:
+    """Map what the brand wrote ("Creator B", "creator b", "B") to offer IDs from the saved lineup"""
+    by_letter = {k.split()[-1].upper(): v for k, v in (labels or {}).items()}
+    found = []
+    for r in requested or []:
+        token = re.sub(r"(?i)creator", "", str(r)).strip().strip(".:,;").upper()
+        if len(token) == 1 and token in by_letter and by_letter[token] not in found:
+            found.append(by_letter[token])
+    return found
+
+
+async def draft_rejection_reply(brand: str, reason, rejected: list) -> str:
+    """Ananya's draft. Falls back to a simple template if the AI call fails."""
+    blocks = []
+    for r in rejected:
+        facts = ", ".join(x for x in [
+            PLATFORM_NAMES.get(str(r.get("platform") or "").lower(), r.get("platform")),
+            f"{_format_followers(r.get('follower_count'))} followers" if r.get("follower_count") else None,
+            f"{r.get('engagement_rate')}% engagement" if r.get("engagement_rate") else None,
+            r.get("location"), r.get("niche"),
+        ] if x)
+        why = _anonymize(r.get("anon_summary") or "", r)
+        blocks.append(f"{r.get('label')}: {facts}. Why we picked them: {why or 'not recorded'}")
+    try:
+        draft = (await call_claude(REJECTION_DRAFT_PROMPT, f"""BRAND: {brand}
+THEIR REASON: {reason or 'none given'}
+
+CREATORS THEY WANT TO REMOVE:
+""" + "\n".join(blocks))).strip()
+    except Exception as e:
+        print(f"Rejection draft failed for {brand}: {e}")
+        labels = ", ".join(r.get("label") or "the creator" for r in rejected)
+        ask = ("" if reason else " So we can find the right fit, could you share what you're looking for, "
+               "e.g. audience, content style or follower range?")
+        draft = (f"Hi {brand} team,\n\nThanks for reviewing the lineup. We're happy to adjust {labels}.{ask}"
+                 f"\n\nAnanya\nBrand Partnerships")
+    for r in rejected:
+        draft = _anonymize(draft, r)
+    return draft
+
+
 class LineupReplyRequest(BaseModel):
     campaign_id: str
     gmail_message_id: str
@@ -2732,12 +2794,39 @@ async def parse_lineup_reply(req: LineupReplyRequest):
 
         result = {"status": "success", "campaign_id": req.campaign_id, "intent": intent, "summary": summary,
                   "reply_email": None, "start_payment_wait": False, "payment_prompt": None,
+                  "start_rejection_review": False, "rejection_prompt": None, "rejection_draft": None,
+                  "start_close_review": False, "close_prompt": None, "close_reason": None,
                   "slack_replies_text": None, "slack_approvals_text": None}
         action = intent
 
         # Confirming only counts while the lineup is open
         if intent == "confirm" and c["status"] != "shortlist_sent":
             action = "question" if c["status"] != "confirmed" else "note"
+
+        # Rejections and declines only apply while the lineup is open
+        if intent in ("reject_creators", "decline") and c["status"] != "shortlist_sent":
+            action = "question"
+
+        # Work out exactly which creators, and draft Ananya's reply, BEFORE any database transaction
+        rejected, draft = [], None
+        if action == "reject_creators":
+            saved_labels = c.get("lineup_labels") or {}
+            rejected_ids = _match_labels(parsed.get("rejected_labels"), saved_labels)
+            if not rejected_ids:
+                action = "question"          # can't tell which creator they mean: Deven reads it
+            else:
+                with engine.connect() as conn:
+                    rows = conn.execute(text("""
+                        SELECT o.offer_id, cr.creator_name, cr.handle, cr.platform, cr.follower_count,
+                               cr.engagement_rate, cr.location, cr.niche, m.anon_summary
+                        FROM offers o
+                        JOIN creators cr ON cr.creator_id = o.creator_id
+                        LEFT JOIN matches m ON m.id = o.match_id
+                        WHERE o.offer_id = ANY(:ids)
+                    """), {"ids": rejected_ids}).mappings().all()
+                label_of = {v: k for k, v in saved_labels.items()}
+                rejected = [{**dict(r), "label": label_of.get(r["offer_id"])} for r in rows]
+                draft = await draft_rejection_reply(brand, reason, rejected)
 
         with engine.begin() as conn:
             conn.execute(text("""
@@ -2753,6 +2842,10 @@ async def parse_lineup_reply(req: LineupReplyRequest):
             if action == "confirm":
                 conn.execute(text("UPDATE campaigns SET status = 'confirmed' WHERE campaign_id = :cid"),
                              {"cid": req.campaign_id})
+                conn.execute(text("""
+                    UPDATE offers SET brand_rejected_at = NULL, release_after = NULL
+                    WHERE campaign_id = :cid AND status = 'accepted'
+                """), {"cid": req.campaign_id})
                 advance = c["advance_amount"] or 0
                 registered = float(s.get("gst_registered", 0)) >= 1
                 gst_on_advance = int(round(advance * float(s.get("gst_rate", 0.18)))) if registered else 0
@@ -2790,13 +2883,30 @@ Brand Partnerships"""
                                                   f"then tap *Payment received* on the waiting message.")
                 result["slack_replies_text"] = f"💸 *{brand}*: {summary}"
 
-            elif action in ("reject_creators", "decline"):
-                what = ("wants to swap " + ", ".join(parsed.get("rejected_labels") or ["a creator"])
-                        if action == "reject_creators" else "doesn't want to go ahead")
-                why = f" Reason: {reason}" if reason else ""
-                result["slack_approvals_text"] = (f"🔁 *{brand}* {what}.{why}\nReply to them in Gmail for now; "
-                                                  f"the automated flow for this comes in Phase C.")
-                result["slack_replies_text"] = f"🔁 *{brand}*: {summary}"
+            elif action == "reject_creators":
+                hold = int(s.get("creator_hold_hours", 48))
+                conn.execute(text("""
+                    UPDATE offers SET brand_rejected_at = NOW(), release_after = NOW() + make_interval(hours => :h)
+                    WHERE offer_id = ANY(:ids)
+                """), {"h": hold, "ids": [r["offer_id"] for r in rejected]})
+                labels_txt = ", ".join(r["label"] for r in rejected if r["label"])
+                names = ", ".join(r["creator_name"] for r in rejected)
+                why = f"\nTheir reason: _{reason}_" if reason else "\nNo reason given."
+                result["start_rejection_review"] = True
+                result["rejection_draft"] = draft
+                result["rejection_prompt"] = (
+                    f"🔁 *{brand}* wants to remove {labels_txt} ({names}).{why}\n"
+                    f"Held for {hold} hours.\n\n*Ananya's draft reply:*\n```{draft}```\n\n"
+                    f"Send the draft, edit it, replace the creator, or proceed with fewer creators.")
+                result["slack_replies_text"] = f"🔁 *{brand}* wants to remove {labels_txt}."
+
+            elif action == "decline":
+                why = f" Reason: _{reason}_" if reason else ""
+                result["start_close_review"] = True
+                result["close_reason"] = reason
+                result["close_prompt"] = (f"🛑 *{brand}* doesn't want to go ahead with the campaign.{why}\n"
+                                          f"Close it and release the creators, or keep it open to follow up yourself?")
+                result["slack_replies_text"] = f"🛑 *{brand}* declined the lineup."
 
             elif action == "question":
                 result["slack_approvals_text"] = (f"❓ *{brand}* has a question about the lineup:\n"
@@ -3014,6 +3124,285 @@ Brand Partnerships"""
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error recording payment: {str(e)}")
+
+
+# ============ REJECTIONS, DECLINES, DEADLINES (STAGE 6, PHASE C) ============
+def _creator_reply_to(conn, campaign_id, creator_id, thread_id, offer_msg):
+    """Something in this creator's negotiation to reply to, from most to least specific"""
+    reply_to = conn.execute(text("""
+        SELECT gmail_message_id FROM conversations
+        WHERE gmail_thread_id = :t AND direction = 'inbound' AND gmail_message_id IS NOT NULL
+        ORDER BY created_at DESC LIMIT 1
+    """), {"t": thread_id}).scalar() if thread_id else None
+    reply_to = reply_to or offer_msg
+    if not reply_to:
+        reply_to = conn.execute(text("""
+            SELECT gmail_message_id FROM offers
+            WHERE campaign_id = :cid AND creator_id = :crid AND gmail_message_id IS NOT NULL
+            ORDER BY round DESC LIMIT 1
+        """), {"cid": campaign_id, "crid": creator_id}).scalar()
+    if not reply_to:
+        reply_to = conn.execute(text("""
+            SELECT gmail_message_id FROM conversations
+            WHERE contact_type = 'creator' AND contact_id = :crid AND direction = 'inbound'
+              AND gmail_message_id IS NOT NULL
+            ORDER BY created_at DESC LIMIT 1
+        """), {"crid": creator_id}).scalar()
+    return reply_to
+
+
+def _brand_reply_to(conn, thread_id, fallback=None):
+    return conn.execute(text("""
+        SELECT gmail_message_id FROM conversations
+        WHERE gmail_thread_id = :t AND direction = 'inbound' AND contact_type = 'brand'
+        ORDER BY created_at DESC LIMIT 1
+    """), {"t": thread_id}).scalar() or fallback
+
+
+def build_release_email(first_name, brand_name) -> str:
+    return f"""Hi {first_name},
+
+An update on the {brand_name} campaign: the brand has decided to go in a different direction with the lineup, so we won't be moving ahead with this collaboration.
+
+This isn't a reflection on your content, and there's nothing you need to do. We'll reach out again for a campaign that suits you.
+
+Aditya
+Creator Manager"""
+
+
+def _release_offers(conn, campaign_id, offer_ids, brand_name, reason):
+    """Withdraw accepted offers and prepare a polite release email for each creator"""
+    if not offer_ids:
+        return []
+    rows = [dict(r) for r in conn.execute(text("""
+        UPDATE offers o SET status = 'withdrawn', decline_reason = :reason,
+               brand_rejected_at = NULL, release_after = NULL
+        FROM creators cr
+        WHERE o.offer_id = ANY(:ids) AND cr.creator_id = o.creator_id
+        RETURNING o.offer_id, o.creator_id, o.gmail_thread_id, o.gmail_message_id, cr.creator_name
+    """), {"ids": offer_ids, "reason": reason}).mappings().all()]
+    return [{
+        "offer_id": r["offer_id"],
+        "creator_name": r["creator_name"],
+        "reply_to_message_id": _creator_reply_to(conn, campaign_id, r["creator_id"],
+                                                 r["gmail_thread_id"], r["gmail_message_id"]),
+        "body": build_release_email(_first_name(r["creator_name"]), brand_name),
+    } for r in rows]
+
+
+class ResolveRejectionRequest(BaseModel):
+    campaign_id: str
+    decision: str                        # send draft / edit and send / replace / proceed with fewer
+    edited_email: Optional[str] = None
+    draft: Optional[str] = None
+
+
+@app.post("/lineup/resolve-rejection")
+async def resolve_rejection(req: ResolveRejectionRequest):
+    """Apply Deven's decision after a brand rejected creators from the lineup"""
+    try:
+        d = (req.decision or "").strip().lower()
+        if "edit" in d:
+            decision = "edit"
+        elif "send" in d:
+            decision = "send"
+        elif "replace" in d:
+            decision = "replace"
+        elif "fewer" in d or "proceed" in d:
+            decision = "fewer"
+        else:
+            raise HTTPException(status_code=400, detail="decision must be send draft, edit and send, replace, or proceed with fewer")
+        if decision == "edit" and not (req.edited_email or "").strip():
+            raise HTTPException(status_code=400, detail="Edit and send needs the edited email text")
+
+        with engine.begin() as conn:
+            c = conn.execute(text("""
+                SELECT c.*, b.brand_name FROM campaigns c JOIN brands b ON b.brand_id = c.brand_id
+                WHERE c.campaign_id = :cid
+            """), {"cid": req.campaign_id}).mappings().first()
+            if not c:
+                raise HTTPException(status_code=404, detail="Campaign not found")
+            c = dict(c)
+            brand = c["brand_name"]
+            held = [r[0] for r in conn.execute(text("""
+                SELECT offer_id FROM offers
+                WHERE campaign_id = :cid AND status = 'accepted' AND brand_rejected_at IS NOT NULL
+            """), {"cid": req.campaign_id}).fetchall()]
+
+            result = {"status": "success", "campaign_id": req.campaign_id, "decision": decision,
+                      "reply_email": None, "brand_reply_to_message_id": _brand_reply_to(conn, c["gmail_thread_id"],
+                                                                                        c["lineup_message_id"]),
+                      "creator_release_emails": [], "start_next_offers": False, "start_send_lineup": False,
+                      "slack_text": None}
+
+            if not held:
+                result["status"] = "skipped"
+                result["slack_text"] = f"ℹ️ No held creators for *{brand}*, so nothing was changed."
+                return result
+
+            labels_of = {v: k for k, v in (c.get("lineup_labels") or {}).items()}
+            held_labels = ", ".join(labels_of.get(o, "a creator") for o in held)
+
+            if decision in ("send", "edit"):
+                body = req.edited_email.strip() if decision == "edit" else (req.draft or "").strip()
+                if not body:
+                    raise HTTPException(status_code=400, detail="No draft text to send")
+                result["reply_email"] = body
+                result["slack_text"] = (f"📨 Reply sent to *{brand}* about {held_labels}. "
+                                        f"The creator(s) stay held until they answer or the hold runs out.")
+
+            elif decision == "replace":
+                result["creator_release_emails"] = _release_offers(conn, req.campaign_id, held, brand, "rejected by brand")
+                conn.execute(text("UPDATE campaigns SET status = 'offers_sent' WHERE campaign_id = :cid"),
+                             {"cid": req.campaign_id})
+                result["reply_email"] = (f"Hi {brand} team,\n\nThanks for the feedback. We're lining up a replacement "
+                                         f"for {held_labels} and will send you an updated lineup shortly.\n\n"
+                                         f"Ananya\nBrand Partnerships")
+                result["start_next_offers"] = True
+                result["slack_text"] = (f"🔄 Replacing {held_labels} for *{brand}*. The creator(s) were released, "
+                                        f"and the next approved creator gets an offer.")
+
+            else:  # proceed with fewer creators
+                result["creator_release_emails"] = _release_offers(conn, req.campaign_id, held, brand, "rejected by brand")
+                result["start_send_lineup"] = True
+                note = (" ⚠️ This is a campaign-pool budget, so the price stays the same with fewer creators. "
+                        "Check it in the preview before sending." if c["pricing_model"] != "per_collab" else "")
+                result["slack_text"] = (f"➖ Proceeding without {held_labels} for *{brand}*. "
+                                        f"An updated lineup is coming for your approval.{note}")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error resolving rejection: {str(e)}")
+
+
+class CloseCampaignRequest(BaseModel):
+    campaign_id: str
+    reason: Optional[str] = None
+
+
+@app.post("/lineup/close")
+async def close_campaign(req: CloseCampaignRequest):
+    """Brand declined: mark the campaign lost, release every accepted creator, thank the brand"""
+    try:
+        with engine.begin() as conn:
+            c = conn.execute(text("""
+                SELECT c.*, b.brand_name FROM campaigns c JOIN brands b ON b.brand_id = c.brand_id
+                WHERE c.campaign_id = :cid
+            """), {"cid": req.campaign_id}).mappings().first()
+            if not c:
+                raise HTTPException(status_code=404, detail="Campaign not found")
+            c = dict(c)
+            brand = c["brand_name"]
+            if c["status"] in ("lost", "cancelled", "completed", "in_production"):
+                return {"status": "skipped", "campaign_id": req.campaign_id, "reply_email": None,
+                        "brand_reply_to_message_id": None, "creator_release_emails": [],
+                        "slack_text": f"ℹ️ `{req.campaign_id}` is `{c['status']}`, so nothing was changed."}
+
+            conn.execute(text("""
+                UPDATE campaigns SET status = 'lost', lost_reason = :reason WHERE campaign_id = :cid
+            """), {"cid": req.campaign_id, "reason": req.reason or "brand declined the lineup"})
+            active = [r[0] for r in conn.execute(text("""
+                SELECT offer_id FROM offers WHERE campaign_id = :cid AND status IN ('accepted', 'sent', 'countered')
+            """), {"cid": req.campaign_id}).fetchall()]
+            releases = _release_offers(conn, req.campaign_id, active, brand, "campaign closed")
+
+            return {
+                "status": "success",
+                "campaign_id": req.campaign_id,
+                "brand_reply_to_message_id": _brand_reply_to(conn, c["gmail_thread_id"], c["lineup_message_id"]),
+                "reply_email": (f"Hi {brand} team,\n\nThanks for letting us know, and for considering the lineup. "
+                                f"If your plans change or you have another campaign coming up, just reply here "
+                                f"and we'll put together a fresh set of creators.\n\nAnanya\nBrand Partnerships"),
+                "creator_release_emails": releases,
+                "slack_text": f"🛑 *{brand}* campaign closed. {len(releases)} creator(s) released politely.",
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error closing campaign: {str(e)}")
+
+
+@app.post("/lineup/check-deadlines")
+async def check_lineup_deadlines():
+    """
+    Hourly: remind brands, alert Deven at the deadline, and release creators whose hold ran out.
+    Nothing is ever cancelled automatically.
+    """
+    try:
+        s = load_settings()
+        short_days = int(s.get("short_timeline_days", 7))
+        remind_h = int(s.get("lineup_reminder_hours", 48))
+        remind_h_short = int(s.get("lineup_reminder_hours_short", 12))
+        reminders, alerts, releases, refill = [], [], [], []
+
+        with engine.begin() as conn:
+            open_lineups = [dict(r) for r in conn.execute(text("""
+                SELECT c.*, b.brand_name FROM campaigns c JOIN brands b ON b.brand_id = c.brand_id
+                WHERE c.status = 'shortlist_sent' AND c.lineup_sent_at IS NOT NULL
+            """)).mappings().all()]
+            now = datetime.utcnow()
+
+            for c in open_lineups:
+                short = c["timeline_days"] is not None and c["timeline_days"] <= short_days
+                hours = remind_h_short if short else remind_h
+
+                # 1. Friendly reminder to the brand
+                if not c["lineup_reminder_sent_at"] and c["lineup_sent_at"] + timedelta(hours=hours) <= now:
+                    expires = (c["lineup_expires_at"].replace(tzinfo=timezone.utc).astimezone(IST).strftime('%d %b, %I:%M %p')
+                               if c["lineup_expires_at"] else "soon")
+                    reminders.append({
+                        "campaign_id": c["campaign_id"],
+                        "brand_name": c["brand_name"],
+                        "reply_to_message_id": _brand_reply_to(conn, c["gmail_thread_id"], c["lineup_message_id"]),
+                        "body": f"""Hi {c['brand_name']} team,
+
+A quick reminder: we're holding your creator lineup until {expires} IST. The creators have set aside time for this campaign.
+
+Just reply "Confirm" to lock it in, or let us know if you'd like any changes.
+
+Ananya
+Brand Partnerships""",
+                    })
+                    conn.execute(text("UPDATE campaigns SET lineup_reminder_sent_at = NOW() WHERE campaign_id = :cid"),
+                                 {"cid": c["campaign_id"]})
+
+                # 2. Deadline passed: alert Deven once, never cancel automatically
+                if not c["lineup_deadline_alerted_at"] and c["lineup_expires_at"] and c["lineup_expires_at"] <= now:
+                    alerts.append(f"⏰ *{c['brand_name']}* hasn't confirmed the lineup (`{c['campaign_id']}`), "
+                                  f"and the window has passed. Chase them personally, or close the campaign.")
+                    conn.execute(text("UPDATE campaigns SET lineup_deadline_alerted_at = NOW() WHERE campaign_id = :cid"),
+                                 {"cid": c["campaign_id"]})
+
+            # 3. Held creators whose 48 hours ran out while the brand hadn't come round
+            expired_holds = [dict(r) for r in conn.execute(text("""
+                SELECT o.offer_id, o.campaign_id, b.brand_name
+                FROM offers o
+                JOIN campaigns c ON c.campaign_id = o.campaign_id
+                JOIN brands b ON b.brand_id = c.brand_id
+                WHERE o.status = 'accepted' AND o.release_after IS NOT NULL AND o.release_after <= NOW()
+                  AND c.status = 'shortlist_sent'
+            """)).mappings().all()]
+            by_campaign = {}
+            for h in expired_holds:
+                by_campaign.setdefault((h["campaign_id"], h["brand_name"]), []).append(h["offer_id"])
+            for (cid, brand), ids in by_campaign.items():
+                releases += _release_offers(conn, cid, ids, brand, "brand hold expired")
+                conn.execute(text("UPDATE campaigns SET status = 'offers_sent' WHERE campaign_id = :cid"), {"cid": cid})
+                refill.append({"campaign_id": cid})
+                alerts.append(f"⌛ Hold ran out for {len(ids)} creator(s) on *{brand}* (`{cid}`). "
+                              f"They were released, and the next approved creator gets an offer.")
+
+        return {
+            "status": "success",
+            "reminders": reminders,
+            "creator_release_emails": releases,
+            "refill_campaigns": refill,
+            "slack_text": "\n".join(alerts) if alerts else None,
+            "counts": {"reminders": len(reminders), "releases": len(releases), "alerts": len(alerts)},
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error checking lineup deadlines: {str(e)}")
 
 
 # ============ BRANDS CRUD ============
