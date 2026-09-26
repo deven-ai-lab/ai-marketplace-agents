@@ -2813,6 +2813,10 @@ async def parse_lineup_reply(req: LineupReplyRequest):
             saved_labels = c.get("lineup_labels") or {}
             rejected_ids = _match_labels(parsed.get("rejected_labels"), saved_labels)
             if not rejected_ids:
+                # Backup: look for "Creator A/B/C" in the brand's own words
+                mentioned = re.findall(r"(?i)\bcreator\s+([a-z])\b", strip_quoted_reply(req.reply_body))
+                rejected_ids = _match_labels(mentioned, saved_labels)
+            if not rejected_ids:
                 action = "question"          # can't tell which creator they mean: Deven reads it
             else:
                 with engine.connect() as conn:
