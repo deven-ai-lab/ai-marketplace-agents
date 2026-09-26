@@ -1242,10 +1242,10 @@ Score ALL {len(candidates)} candidates. Return ONLY the JSON array."""
                 row = conn.execute(text("""
                     INSERT INTO matches (campaign_id, creator_id, rank, match_score, score_breakdown,
                         reasoning, concerns, red_flags, is_stretch, suggested_payout,
-                        creator_min_budget_at_match, fred_model, fred_version)
+                        creator_min_budget_at_match, fred_model, fred_version, anon_summary)
                     VALUES (:campaign_id, :creator_id, :rank, :match_score, CAST(:score_breakdown AS JSONB),
                         :reasoning, :concerns, :red_flags, :is_stretch, :suggested_payout,
-                        :min_budget, :fred_model, :fred_version)
+                        :min_budget, :fred_model, :fred_version, :anon_summary)
                     ON CONFLICT (campaign_id, creator_id) DO NOTHING
                     RETURNING id
                 """), {
@@ -1262,6 +1262,7 @@ Score ALL {len(candidates)} candidates. Return ONLY the JSON array."""
                     "min_budget": x["min_budget"],
                     "fred_model": FRED_MODEL,
                     "fred_version": FRED_VERSION,
+                    "anon_summary": _anonymize(x["anon_summary"], x),
                 }).first()
                 x["match_id"] = row[0] if row else None
 
@@ -2184,7 +2185,7 @@ Return ONLY the JSON object."""
                 if target and accepted >= target:
                     result["all_slots_filled"] = True
                     result["slack_approvals_text"] = (f"🎯 *All {target} slot(s) filled for {brand}* "
-                                                      f"(`{offer['cid']}`). Ready to send the shortlist to the brand.")
+                                                      f"(`{offer['cid']}`). Preparing the lineup for the brand.")
 
             elif action in ("decline", "unsubscribe"):
                 conn.execute(text("""
@@ -2312,7 +2313,8 @@ async def resolve_counter(req: ResolveCounterRequest):
 
             base = {"status": "success", "offer_id": req.offer_id, "campaign_id": offer["campaign_id"],
                     "decision": decision, "reply_email": None, "reply_to_message_id": None,
-                    "new_offer_id": None, "start_next_offers": False, "slack_text": None}
+                    "new_offer_id": None, "start_next_offers": False, "slack_text": None,
+                    "all_slots_filled": False}
 
             if offer["status"] != "countered":
                 return {**base, "status": "skipped",
@@ -2342,7 +2344,8 @@ async def resolve_counter(req: ResolveCounterRequest):
                 accepted, target = _slot_status(conn, offer["campaign_id"], offer["pricing_model"], offer["slots"])
                 text_out = f"✅ Counter accepted: *{name}* joins {brand} at {format_inr(counter)}. {accepted}/{target} slot(s) filled."
                 if target and accepted >= target:
-                    text_out += f"\n🎯 *All {target} slot(s) filled for {brand}*. Ready to send the shortlist to the brand."
+                    text_out += f"\n🎯 *All {target} slot(s) filled for {brand}*. Preparing the lineup for the brand."
+                    base["all_slots_filled"] = True
                 base["slack_text"] = text_out
 
             elif decision == "decline":
@@ -2434,6 +2437,195 @@ async def expire_offers():
                 "campaigns": campaigns, "slack_text": slack_text}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error expiring offers: {str(e)}")
+
+
+# ============ BRAND LINEUP (STAGE 6, PHASE A) ============
+def _brand_price_lines(price: int, s: dict) -> dict:
+    """Price, GST and the 70/30 split. GST appears only once registered."""
+    registered = float(s.get("gst_registered", 0)) >= 1
+    rate = float(s.get("gst_rate", 0.18))
+    advance_pct = float(s.get("advance_pct", 0.7))
+    advance = int(round(price * advance_pct))
+    balance = price - advance
+    gst = int(round(price * rate)) if registered else 0
+    suffix = " + GST" if registered else ""
+    total_line = (f"{format_inr(price)} + {int(rate * 100)}% GST ({format_inr(gst)}) = {format_inr(price + gst)} total"
+                  if registered else f"{format_inr(price)} total")
+    return {
+        "price": price, "gst": gst, "advance": advance, "balance": balance,
+        "total_line": total_line,
+        "advance_line": f"{int(advance_pct * 100)}% advance ({format_inr(advance)}{suffix}) to confirm the lineup",
+        "balance_line": f"Remaining {100 - int(advance_pct * 100)}% ({format_inr(balance)}{suffix}) before the content goes live",
+    }
+
+
+class LineupRequest(BaseModel):
+    campaign_id: str
+
+
+@app.post("/lineup/prepare")
+async def prepare_lineup(req: LineupRequest):
+    """
+    Build the anonymized lineup email for the brand from accepted offers.
+    Prices, terms and dates come from data; creator names never appear.
+    """
+    try:
+        s = load_settings()
+        with engine.begin() as conn:
+            c = conn.execute(text("""
+                SELECT c.*, b.brand_name, b.industry
+                FROM campaigns c JOIN brands b ON b.brand_id = c.brand_id
+                WHERE c.campaign_id = :cid
+            """), {"cid": req.campaign_id}).mappings().first()
+            if not c:
+                raise HTTPException(status_code=404, detail="Campaign not found")
+            c = dict(c)
+
+            creators = [dict(r) for r in conn.execute(text("""
+                SELECT o.offer_id, o.deliverables, cr.creator_name, cr.handle, cr.platform,
+                       cr.follower_count, cr.engagement_rate, cr.location, cr.niche,
+                       m.anon_summary
+                FROM offers o
+                JOIN creators cr ON cr.creator_id = o.creator_id
+                LEFT JOIN matches m ON m.id = o.match_id
+                WHERE o.campaign_id = :cid AND o.status = 'accepted'
+                ORDER BY m.rank NULLS LAST, o.offer_id
+            """), {"cid": req.campaign_id}).mappings().all()]
+            if not creators:
+                raise HTTPException(status_code=400, detail="No accepted creators for this campaign yet")
+
+            # The brand's latest message in the campaign thread: the lineup goes out as a reply to it
+            reply_to = conn.execute(text("""
+                SELECT gmail_message_id FROM conversations
+                WHERE gmail_thread_id = :t AND direction = 'inbound' AND contact_type = 'brand'
+                ORDER BY created_at DESC LIMIT 1
+            """), {"t": c["gmail_thread_id"]}).scalar()
+
+            # Brand price: per collab = rate x confirmed creators; campaign pool = the agreed budget
+            if c["pricing_model"] == "per_collab" and c["rate_per_collab"]:
+                price = c["rate_per_collab"] * len(creators)
+                per_creator = f" ({format_inr(c['rate_per_collab'])} per creator)"
+            else:
+                price = c["total_budget"] or 0
+                per_creator = ""
+            p = _brand_price_lines(price, s)
+
+            # Confirmation window
+            short = c["timeline_days"] is not None and c["timeline_days"] <= int(s.get("short_timeline_days", 7))
+            hours = int(s.get("lineup_window_hours_short", 24) if short else s.get("lineup_window_hours", 72))
+            expires_at = datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(hours=hours)
+
+            if c["deadline"]:
+                deadline = c["deadline"]
+            elif c["timeline_days"]:
+                deadline = (c["created_at"] + timedelta(days=c["timeline_days"])).date()
+            else:
+                deadline = None
+
+            # Anonymized creator blocks
+            blocks = []
+            for i, cr in enumerate(creators):
+                facts = " · ".join(x for x in [
+                    PLATFORM_NAMES.get(str(cr["platform"] or "").lower(), cr["platform"]),
+                    f"{_format_followers(cr['follower_count'])} followers" if cr["follower_count"] else None,
+                    f"{cr['engagement_rate']}% engagement" if cr["engagement_rate"] else None,
+                    cr["location"],
+                ] if x)
+                why = cr["anon_summary"] or f"{(cr['niche'] or 'Content').capitalize()} creator with an engaged audience."
+                why = _anonymize(why, cr)
+                blocks.append(f"Creator {chr(65 + i)} · {facts}\n{why}\nDeliverable: {cr['deliverables'] or 'as per the brief'}")
+
+            terms = [
+                f"• {p['advance_line']}",
+                f"• {p['balance_line']}",
+                "• The advance becomes non-refundable once creators have started producing content",
+            ]
+            if c["revisions_allowed"]:
+                terms.append(f"• Up to {c['revisions_allowed']} round{'s' if c['revisions_allowed'] > 1 else ''} of revisions per creator")
+            if deadline:
+                terms.append(f"• Content live by {deadline.strftime('%d %b %Y')}")
+            if c["exclusivity_days"]:
+                terms.append(f"• Creators won't post for competing {(c['industry'] or '').strip() or 'category'} brands "
+                             f"for {c['exclusivity_days']} days after publishing")
+
+            months = int(s.get("non_circumvention_months", 12))
+            n = len(creators)
+            body = f"""Hi {c['brand_name']} team,
+
+Your creator lineup is ready. All {n} creator{'s have' if n > 1 else ' has'} already accepted, so the campaign can start as soon as you confirm.
+
+YOUR LINEUP
+
+""" + "\n\n".join(blocks) + f"""
+
+PRICE
+{p['total_line']} for {n} creator{'s' if n > 1 else ''}{per_creator}
+""" + "\n".join(terms) + f"""
+
+Creator names and profiles are shared as soon as the advance is received. For the next {months} months, collaborations with creators introduced by us are arranged through us.
+
+To confirm, just reply "Confirm". If you'd like to swap anyone or have questions, reply and let us know.
+We're holding this lineup for you until {expires_at.astimezone(IST).strftime('%d %b, %I:%M %p')} IST.
+
+Ananya
+Brand Partnerships"""
+
+            conn.execute(text("""
+                UPDATE campaigns SET lineup_email = :body, final_brand_price = :price,
+                       gst_amount = :gst, advance_amount = :advance, lineup_expires_at = :expires
+                WHERE campaign_id = :cid
+            """), {"body": body, "price": price, "gst": p["gst"], "advance": p["advance"],
+                   "expires": expires_at.replace(tzinfo=None), "cid": req.campaign_id})
+
+        return {
+            "status": "success",
+            "campaign_id": req.campaign_id,
+            "brand_name": c["brand_name"],
+            "creators": n,
+            "price": price, "gst": p["gst"], "advance": p["advance"],
+            "reply_to_message_id": reply_to,
+            "body": body,
+            "slack_preview": (f"📬 *Lineup ready for {c['brand_name']}* (`{req.campaign_id}`): {n} creator(s), "
+                              f"{p['total_line']}.\nApprove to send it as a reply in their email thread.\n\n"
+                              f"```{body}```"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error preparing lineup: {str(e)}")
+
+
+class LineupSentRequest(BaseModel):
+    campaign_id: str
+    gmail_message_id: Optional[str] = None
+    gmail_thread_id: Optional[str] = None
+
+
+@app.post("/lineup/mark-sent")
+async def mark_lineup_sent(req: LineupSentRequest):
+    """Record the lineup email and start the brand's confirmation window"""
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(text("""
+                UPDATE campaigns SET status = 'shortlist_sent', lineup_sent_at = NOW(),
+                       lineup_message_id = :msg
+                WHERE campaign_id = :cid
+                RETURNING brand_id, lineup_email, gmail_thread_id
+            """), {"cid": req.campaign_id, "msg": req.gmail_message_id}).mappings().first()
+            if not row:
+                raise HTTPException(status_code=404, detail="Campaign not found")
+            conn.execute(text("""
+                INSERT INTO conversations (contact_type, contact_id, gmail_thread_id, gmail_message_id,
+                                           direction, subject, body, intent)
+                VALUES ('brand', :bid, :thread, :msg, 'outbound', 'Creator lineup', :body, 'lineup')
+                ON CONFLICT (gmail_message_id) DO NOTHING
+            """), {"bid": row["brand_id"], "thread": req.gmail_thread_id or row["gmail_thread_id"],
+                   "msg": req.gmail_message_id, "body": row["lineup_email"]})
+        return {"status": "success", "campaign_id": req.campaign_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error marking lineup sent: {str(e)}")
 
 
 # ============ BRANDS CRUD ============
