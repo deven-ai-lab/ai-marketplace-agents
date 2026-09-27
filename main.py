@@ -3409,6 +3409,69 @@ Brand Partnerships""",
         raise HTTPException(status_code=500, detail=f"Error checking lineup deadlines: {str(e)}")
 
 
+# ============ OUTBOUND EMAIL LOG ============
+class OutboundLogRequest(BaseModel):
+    gmail_message_id: str
+    gmail_thread_id: Optional[str] = None
+    to_email: Optional[str] = None
+    subject: Optional[str] = None
+    body: Optional[str] = None
+
+
+@app.post("/conversations/log-outbound")
+async def log_outbound(req: OutboundLogRequest):
+    """
+    Log any email sent from the agency inbox, matched to its contact by thread.
+    Emails already logged elsewhere are skipped; unrelated threads are ignored.
+    """
+    try:
+        with engine.begin() as conn:
+            if conn.execute(text("SELECT 1 FROM conversations WHERE gmail_message_id = :m"),
+                            {"m": req.gmail_message_id}).first():
+                return {"logged": False, "reason": "already logged"}
+
+            contact, t = None, req.gmail_thread_id
+            if t:
+                # Most specific first: offer threads, campaign threads, then pitch threads
+                row = conn.execute(text("""
+                    SELECT creator_id FROM offers WHERE gmail_thread_id = :t ORDER BY round DESC LIMIT 1
+                """), {"t": t}).first()
+                if row:
+                    contact = ("creator", row[0], "offer_thread")
+                if not contact:
+                    row = conn.execute(text("SELECT brand_id FROM campaigns WHERE gmail_thread_id = :t LIMIT 1"),
+                                       {"t": t}).first()
+                    if row:
+                        contact = ("brand", row[0], "campaign_thread")
+                if not contact:
+                    row = conn.execute(text("SELECT brand_id FROM brands WHERE gmail_thread_id = :t LIMIT 1"),
+                                       {"t": t}).first()
+                    if row:
+                        contact = ("brand", row[0], "pitch_thread")
+                if not contact:
+                    row = conn.execute(text("SELECT creator_id FROM creators WHERE gmail_thread_id = :t LIMIT 1"),
+                                       {"t": t}).first()
+                    if row:
+                        contact = ("creator", row[0], "pitch_thread")
+
+            if not contact:
+                return {"logged": False, "reason": "not an outreach thread"}
+
+            ctype, cid, where = contact
+            conn.execute(text("""
+                INSERT INTO conversations (contact_type, contact_id, gmail_thread_id, gmail_message_id,
+                                           direction, to_email, subject, body, intent)
+                VALUES (:ctype, :cid, :thread, :msg, 'outbound', :to_email, :subject, :body, 'sent')
+                ON CONFLICT (gmail_message_id) DO NOTHING
+            """), {"ctype": ctype, "cid": cid, "thread": t, "msg": req.gmail_message_id,
+                   "to_email": req.to_email, "subject": req.subject,
+                   "body": strip_quoted_reply(req.body or "")})
+
+        return {"logged": True, "contact_type": ctype, "contact_id": cid, "matched_by": where}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error logging outbound email: {str(e)}")
+
+
 # ============ BRANDS CRUD ============
 @app.post("/brands")
 async def create_brand(brand: dict):
