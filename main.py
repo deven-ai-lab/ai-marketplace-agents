@@ -613,7 +613,8 @@ PRICING MODEL:
 - "campaign_pool": the brand gives a TOTAL budget for the campaign (e.g. "2.5 lakh for the campaign")
 - "per_collab": the brand gives a rate PER creator or PER collaboration (e.g. "20k per collab", "15k per reel")
 - null: no budget mentioned
-Put a total budget in total_budget. Put a per-creator rate in rate_per_collab, and the number of creators wanted in slots.
+Put a total budget in total_budget. Put a per-creator rate in rate_per_collab.
+Put the number of creators wanted in slots, for EITHER pricing model ("3 creators" = 3), else null.
 
 TIMELINE:
 - timeline_days is the number of days until the content should be live, as an integer.
@@ -1808,11 +1809,18 @@ async def prepare_offers(req: OfferPrepareRequest):
                 SELECT COUNT(*) FROM matches WHERE campaign_id = :cid AND approval_status = 'approved'
             """), {"cid": req.campaign_id}).scalar() or 0
 
-            # How many creators this campaign needs
-            if campaign["pricing_model"] == "per_collab":
-                target = campaign["slots"] or 1
+            # How many creators this campaign needs: a FIXED number, set once
+            if campaign["slots"]:
+                target = campaign["slots"]
+            elif campaign["pricing_model"] == "per_collab":
+                target = 1
             else:
+                # Campaign pool with no count in the brief: lock it to the first approved shortlist,
+                # so approving replacements later never moves the goalposts
                 target = approved_count
+                if target:
+                    conn.execute(text("UPDATE campaigns SET slots = :n WHERE campaign_id = :cid AND slots IS NULL"),
+                                 {"n": target, "cid": req.campaign_id})
 
             in_play = conn.execute(text("""
                 SELECT COUNT(DISTINCT creator_id) FROM offers
@@ -2196,15 +2204,7 @@ Return ONLY the JSON object."""
                     first, brand, offer["deliverables"], offer["deadline"], final, script_step, s)
 
                 # Slots filled?
-                accepted = conn.execute(text("""
-                    SELECT COUNT(*) FROM offers WHERE campaign_id = :cid AND status = 'accepted'
-                """), {"cid": offer["cid"]}).scalar() or 0
-                if offer["pricing_model"] == "per_collab":
-                    target = offer["slots"] or 1
-                else:
-                    target = conn.execute(text("""
-                        SELECT COUNT(*) FROM matches WHERE campaign_id = :cid AND approval_status = 'approved'
-                    """), {"cid": offer["cid"]}).scalar() or 0
+                accepted, target = _slot_status(conn, offer["cid"], offer["pricing_model"], offer["slots"])
                 note = " (accepted your counter)" if accepted_amount else ""
                 result["slack_replies_text"] = (f"✅ *{name}* accepted the {brand} offer{note} at {format_inr(final)}. "
                                                 f"{accepted}/{target} slot(s) filled.")
@@ -2290,8 +2290,10 @@ def _slot_status(conn, campaign_id, pricing_model, slots):
     accepted = conn.execute(text("""
         SELECT COUNT(*) FROM offers WHERE campaign_id = :cid AND status = 'accepted'
     """), {"cid": campaign_id}).scalar() or 0
-    if pricing_model == "per_collab":
-        target = slots or 1
+    if slots:
+        target = slots                  # fixed at the brief, or at the first approved shortlist
+    elif pricing_model == "per_collab":
+        target = 1
     else:
         target = conn.execute(text("""
             SELECT COUNT(*) FROM matches WHERE campaign_id = :cid AND approval_status = 'approved'
@@ -2533,6 +2535,9 @@ async def prepare_lineup(req: LineupRequest):
                 per_creator = f" ({format_inr(c['rate_per_collab'])} per creator)"
             else:
                 price = c["total_budget"] or 0
+                per_creator = ""
+            if c.get("lineup_price_override"):
+                price = c["lineup_price_override"]      # set by Deven for a smaller lineup
                 per_creator = ""
             p = _brand_price_lines(price, s)
 
@@ -3470,6 +3475,155 @@ async def log_outbound(req: OutboundLogRequest):
         return {"logged": True, "contact_type": ctype, "contact_id": cid, "matched_by": where}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error logging outbound email: {str(e)}")
+
+
+# ============ UNFILLED CAMPAIGNS ============
+class CampaignIdRequest(BaseModel):
+    campaign_id: str
+
+
+@app.post("/campaigns/unfilled-summary")
+async def unfilled_summary(req: CampaignIdRequest):
+    """The state of a campaign that ran out of creators, written for Deven's Slack form"""
+    try:
+        with engine.connect() as conn:
+            c = conn.execute(text("""
+                SELECT c.*, b.brand_name FROM campaigns c JOIN brands b ON b.brand_id = c.brand_id
+                WHERE c.campaign_id = :cid
+            """), {"cid": req.campaign_id}).mappings().first()
+            if not c:
+                raise HTTPException(status_code=404, detail="Campaign not found")
+            c = dict(c)
+            accepted, pending = conn.execute(text("""
+                SELECT COUNT(*) FILTER (WHERE status = 'accepted'),
+                       COUNT(*) FILTER (WHERE status IN ('sent', 'countered'))
+                FROM offers WHERE campaign_id = :cid
+            """), {"cid": req.campaign_id}).first()
+            _, target = _slot_status(conn, req.campaign_id, c["pricing_model"], c["slots"])
+
+        pool = c["pricing_model"] != "per_collab"
+        price = (f"{format_inr(c['total_budget'])} total budget" if pool and c["total_budget"]
+                 else f"{format_inr(c['rate_per_collab'] or 0)} per creator")
+        lines = [
+            f"🟡 *{c['brand_name']}* is short on creators (`{req.campaign_id}`).",
+            f"*{accepted}/{target}* accepted · {pending} offer(s) still pending · {price}",
+            "",
+            "• *Find more creators*: Fred reruns for the open slot(s)",
+            ("• *Send lineup with current creators*: " +
+             ("not possible yet, wait until pending offers are answered" if pending
+              else ("no one has accepted yet" if not accepted
+                    else f"send it with {accepted} creator(s)"
+                         + (f". Enter a new total price, or it stays {format_inr(c['total_budget'])}"
+                            if pool and c["total_budget"] else "")))),
+            "• *Close the campaign*: release everyone and let the brand know politely",
+            "• *Wait for now*: nothing changes",
+        ]
+        return {"status": "success", "campaign_id": req.campaign_id, "brand_name": c["brand_name"],
+                "accepted": accepted, "pending": pending, "target": target,
+                "pricing_model": c["pricing_model"], "slack_prompt": "\n".join(lines)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error summarising campaign: {str(e)}")
+
+
+class ResolveUnfilledRequest(BaseModel):
+    campaign_id: str
+    decision: str                        # find more / send lineup / close / wait
+    new_price: Optional[int] = None      # optional new total for a smaller lineup
+
+
+@app.post("/campaigns/resolve-unfilled")
+async def resolve_unfilled(req: ResolveUnfilledRequest):
+    """Apply Deven's decision for a campaign that ran out of creators"""
+    try:
+        d = (req.decision or "").strip().lower()
+        if "find" in d or "more" in d:
+            decision = "find"
+        elif "send" in d or "lineup" in d:
+            decision = "send"
+        elif "close" in d:
+            decision = "close"
+        elif "wait" in d:
+            decision = "wait"
+        else:
+            raise HTTPException(status_code=400, detail="decision must be find more, send lineup, close, or wait")
+
+        with engine.begin() as conn:
+            c = conn.execute(text("""
+                SELECT c.*, b.brand_name FROM campaigns c JOIN brands b ON b.brand_id = c.brand_id
+                WHERE c.campaign_id = :cid
+            """), {"cid": req.campaign_id}).mappings().first()
+            if not c:
+                raise HTTPException(status_code=404, detail="Campaign not found")
+            c = dict(c)
+            brand = c["brand_name"]
+            result = {"status": "success", "campaign_id": req.campaign_id, "decision": decision,
+                      "start_fred": False, "start_send_lineup": False, "reply_email": None,
+                      "brand_reply_to_message_id": None, "creator_release_emails": [], "slack_text": None}
+
+            if c["status"] not in ("brief_received", "matching", "awaiting_approval", "offers_sent"):
+                result["status"] = "skipped"
+                result["slack_text"] = f"ℹ️ `{req.campaign_id}` is `{c['status']}`, so nothing was changed."
+                return result
+
+            accepted, pending = conn.execute(text("""
+                SELECT COUNT(*) FILTER (WHERE status = 'accepted'),
+                       COUNT(*) FILTER (WHERE status IN ('sent', 'countered'))
+                FROM offers WHERE campaign_id = :cid
+            """), {"cid": req.campaign_id}).first()
+
+            if decision == "find":
+                result["start_fred"] = True
+                result["slack_text"] = f"🔎 Rerunning Fred for *{brand}*. A new shortlist is on its way."
+
+            elif decision == "send":
+                if pending:
+                    result["status"] = "blocked"
+                    result["slack_text"] = (f"⏸️ Can't send *{brand}*'s lineup yet: {pending} offer(s) still pending. "
+                                            f"Wait until they're answered or expire.")
+                elif not accepted:
+                    result["status"] = "blocked"
+                    result["slack_text"] = f"⏸️ Can't send *{brand}*'s lineup: no creator has accepted yet."
+                else:
+                    conn.execute(text("""
+                        UPDATE campaigns SET slots = :n,
+                               lineup_price_override = COALESCE(:price, lineup_price_override)
+                        WHERE campaign_id = :cid
+                    """), {"n": accepted, "price": req.new_price if req.new_price and req.new_price > 0 else None,
+                           "cid": req.campaign_id})
+                    result["start_send_lineup"] = True
+                    price_note = f" at a new total of {format_inr(req.new_price)}" if req.new_price else ""
+                    result["slack_text"] = (f"📬 Preparing *{brand}*'s lineup with {accepted} creator(s){price_note}. "
+                                            f"The preview is coming for your approval.")
+
+            elif decision == "close":
+                conn.execute(text("""
+                    UPDATE campaigns SET status = 'lost', lost_reason = 'could not fill the lineup'
+                    WHERE campaign_id = :cid
+                """), {"cid": req.campaign_id})
+                active = [r[0] for r in conn.execute(text("""
+                    SELECT offer_id FROM offers WHERE campaign_id = :cid AND status IN ('accepted', 'sent', 'countered')
+                """), {"cid": req.campaign_id}).fetchall()]
+                result["creator_release_emails"] = _release_offers(conn, req.campaign_id, active, brand, "campaign closed")
+                result["brand_reply_to_message_id"] = _brand_reply_to(conn, c["gmail_thread_id"])
+                result["reply_email"] = (f"Hi {brand} team,\n\nAn update on your campaign: we weren't able to confirm "
+                                         f"a lineup of creators that fully meets your brief in time, so we're closing "
+                                         f"this request for now rather than send you a weaker fit.\n\n"
+                                         f"If you'd like to adjust the brief, or have another campaign coming up, just "
+                                         f"reply here and we'll put together a fresh set of creators.\n\n"
+                                         f"Ananya\nBrand Partnerships")
+                result["slack_text"] = (f"🛑 *{brand}* campaign closed. "
+                                        f"{len(result['creator_release_emails'])} creator(s) released politely.")
+
+            else:
+                result["slack_text"] = f"⏳ Leaving *{brand}* as it is for now."
+
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error resolving unfilled campaign: {str(e)}")
 
 
 # ============ BRANDS CRUD ============
