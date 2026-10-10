@@ -7,7 +7,8 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Callable
 from types import SimpleNamespace
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Security
+from fastapi.security import APIKeyHeader
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,7 +33,12 @@ MAX_CONCURRENT = 5                # Batches running at the same time (protects r
 MAX_TOKENS = 16000                # Room for adaptive thinking + emails
 
 # ============ APP SETUP ============
+# Adds an "Authorize" button to /docs so you can test with your API key there.
+# The real check is the require_api_key middleware below.
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
 app = FastAPI(
+    dependencies=[Security(api_key_header)],
     title="AI Marketplace Agents",
     description="Prabhaav agents: Ananya (Brand Partnerships, internally 'steve'), Fred (Matcher), Aditya (Creator Manager)",
     version="1.2.0"
@@ -953,31 +959,43 @@ async def aditya_parse_reply(request: ParseReplyRequest):
         raise HTTPException(status_code=500, detail=f"Error parsing creator reply: {str(e)}")
 
 
-# ============ QUESTION DRAFTS (Ananya + Aditya, approved by Deven in Slack) ============
+# ============ REPLY DRAFTS (Ananya + Aditya, approved by Deven in Slack) ============
 DRAFT_REPLY_RULES = """
-TASK: The contact replied to us with one or more questions. Write the reply email that answers them.
-Deven reads your draft in Slack and approves or edits it before anything is sent.
+TASK: The contact replied to our email. Write the reply we send back.
+Deven reads your draft in Slack and approves or edits it before anything is sent, so always write
+a complete, ready-to-send email, even when the case is tricky.
 
-How to answer:
-- Answer every question directly, in the order they were asked, using ONLY the facts in these
+Match the reply to what they wrote:
+- Questions: answer every question directly, in the order asked, using ONLY the facts in these
   instructions and the ANSWER FACTS below. Plain words, no sales talk.
-- If they also shared details (budget, platform, rates, timeline), thank them briefly and don't ask for
-  those again. If something we still need is missing, ask for it in one easy line at the end.
-- If you cannot answer a question from the facts, do not guess. Write that you'll check and come back
-  to them shortly, and set needs_deven to true.
+- Interested and shared details (budget, platform, timeline, rates, restrictions): thank them, confirm in
+  one sentence what you understood, and say clearly what happens next (see ANSWER FACTS).
+  Never ask again for details they already gave. If something essential is missing, ask for it in one
+  easy line at the end.
+- Interested but shared nothing yet: thank them and ask for the essential details in one easy line.
+- Not interested: two or three gracious sentences. Thank them, no persuasion, leave the door open.
+- If they shared bank, UPI, PAN, Aadhaar or card details: never repeat them. Say payment details are
+  handled separately and set needs_deven to true.
+- If you cannot answer something from the facts, do not guess. Say you'll check and come back to them
+  shortly, and set needs_deven to true.
+
+If the DEAL CHECK below says the budget is under our minimum: thank them, explain the minimum politely
+in one or two sentences, ask whether that could work for them, and set needs_deven to true.
+If they need content live in under 7 days: say honestly that it is tight, that you'll confirm the
+earliest realistic date, and set needs_deven to true. Never promise a go-live date.
+
+Format:
 - Greeting: "Hi <first name>," for a person, "Hi <brand name> team," for a brand without a name.
-- 60-150 words. No subject line (it is sent as a reply in the same thread).
+- 50-160 words. No subject line (it is sent as a reply in the same thread).
 - Write each paragraph as one continuous line; separate paragraphs with one blank line.
 
-Set needs_deven to true (and still write your best safe draft) when the reply:
+Also set needs_deven to true when the reply:
 - asks for a discount, a specific price, a rate change or anything about money not covered by the facts
-- asks to change payment terms, contract terms, exclusivity, timelines we haven't agreed, or for legal,
-  tax, GST or invoice details
+- asks to change payment terms, contract terms or exclusivity, or for legal, tax, GST or invoice details
 - is a complaint, is unhappy, or mentions a refund or a problem with a campaign
 - asks whether they are talking to a person or an AI (answer honestly: you are an AI assistant on the
   Prabhaav team, and Deven, the founder, personally reviews every deal and every email before it goes out)
-- asks for creator names or handles before the advance, or asks for the brand's name before acceptance
-- asks anything you could not answer from the facts
+- asks for creator names or handles before the advance, or for the brand's name before acceptance
 
 Return ONLY a valid JSON object, no other text:
 {
@@ -1018,6 +1036,9 @@ def brand_answer_facts(s: dict) -> str:
 - We handle everything: finding creators, briefing, content approval and creator payouts. One point of
   contact, one invoice.
 - Creators clearly mark the content as a paid partnership, as ASCI guidelines require.
+- What happens next once we have budget, platform and timeline: Deven reviews the brief, and we send
+  the anonymised shortlist with prices, usually within 48 hours. The essential details are a rough
+  budget, the platform and the go-live timeline.
 """
 
 
@@ -1039,6 +1060,9 @@ def creator_answer_facts(s: dict) -> str:
 - They can counter an offer by replying with what works for them; Deven reviews every counter.
 - Paid posts must be marked as a paid partnership (#ad or the platform's label), as ASCI requires.
 - Payment details are collected separately by Deven, never over this email thread.
+- What happens next once they share their rate: we add them to our creator network and send them an
+  offer when a campaign fits their niche and audience. The essential detail is their usual rate per
+  collaboration; restrictions, availability and best format are nice to have.
 """
 
 
@@ -1050,7 +1074,21 @@ class DraftReplyRequest(BaseModel):
     reply_body: str                         # their latest email
     questions: Optional[List[str]] = None   # from parse-reply; optional
     summary: Optional[str] = None           # from parse-reply; optional
+    intent: Optional[str] = None            # from parse-reply; optional
+    extracted: Optional[dict] = None        # parse-reply's extracted_data; optional
     original_pitch: Optional[str] = None
+
+    @field_validator("extracted", mode="before")
+    @classmethod
+    def _to_dict(cls, v):
+        if v in (None, ""):
+            return None
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except json.JSONDecodeError:
+                return None
+        return v if isinstance(v, dict) else None
 
     @field_validator("questions", mode="before")
     @classmethod
@@ -1093,14 +1131,42 @@ SENSITIVE_PATTERN = re.compile(
 )
 
 
+PAYMENT_DETAILS_PATTERN = re.compile(r"\bupi\b|@ok|@ybl|@paytm|ifsc|account (?:no|number)|\bpan\b|aadhaar|aadhar",
+                                     re.IGNORECASE)
+NO_REPLY_INTENTS = {"unsubscribe", "auto_reply"}
+
+
+def _deal_check(contact_type: str, extracted: Optional[dict], s: dict) -> tuple:
+    """(text for the prompt, below_minimum) based on the budget parse-reply found"""
+    if contact_type != "brand" or not extracted:
+        return "", False
+    total = to_int_or_none(extracted.get("total_budget"))
+    rate = to_int_or_none(extracted.get("rate_per_collab"))
+    slots = to_int_or_none(extracted.get("slots"))
+    value = total or (rate * slots if rate and slots else rate)
+    if not value:
+        return "DEAL CHECK: no budget shared yet.", False
+    minimum = int(s.get("min_deal_inr", 5000))
+    if value < minimum:
+        return (f"DEAL CHECK: their budget ({format_inr(value)}) is under our minimum campaign size "
+                f"({format_inr(minimum)})."), True
+    return f"DEAL CHECK: their budget ({format_inr(value)}) meets our minimum.", False
+
+
 async def draft_question_reply(contact_type: str, req: DraftReplyRequest) -> dict:
+    intent = (req.intent or "").strip().lower()
+    if intent in NO_REPLY_INTENTS:
+        return {"status": "skipped", "contact_type": contact_type, "contact_id": req.contact_id,
+                "draft": None, "needs_deven": False, "reason": f"No reply needed ({intent})",
+                "flag": "", "answered": [], "unanswered": []}
     s = load_settings()
     is_brand = contact_type == "brand"
+    deal_text, below_minimum = _deal_check(contact_type, req.extracted, s)
     prompt = (STEVE_DRAFT_PROMPT if is_brand else ADITYA_DRAFT_PROMPT) + "\n\n" + (
         brand_answer_facts(s) if is_brand else creator_answer_facts(s))
     reply = strip_quoted_reply(req.reply_body)
     profile = _contact_profile(contact_type, req.contact_id)
-    questions = "\n".join(f"- {q}" for q in (req.questions or [])) or "(not extracted; read the reply)"
+    questions = "\n".join(f"- {q}" for q in (req.questions or [])) or "(none listed; read the reply)"
     message = f"""{'BRAND' if is_brand else 'CREATOR'}: {req.contact_name or req.contact_id}
 From: {req.from_email or 'unknown'}
 Subject: {req.reply_subject or ''}
@@ -1111,6 +1177,10 @@ THEIR LATEST REPLY:
 
 QUESTIONS THEY ASKED:
 {questions}
+
+OUR READ OF THE REPLY: intent {intent or 'unknown'}. {req.summary or ''}
+{('DETAILS THEY SHARED: ' + json.dumps({k: v for k, v in req.extracted.items() if v not in (None, '', []) and k not in ('summary', 'questions', 'intent')}, ensure_ascii=False)) if req.extracted else ''}
+{deal_text}
 
 Write the reply and return ONLY the JSON object."""
 
@@ -1138,6 +1208,12 @@ Write the reply and return ONLY the JSON object."""
         reason = reason or "Reply mentions money, terms, a complaint or AI; please check the draft"
     if unanswered and not needs_deven:
         needs_deven, reason = True, reason or "Some questions couldn't be answered from the facts"
+    if below_minimum:
+        needs_deven = True
+        reason = reason or "Budget is under the minimum campaign size"
+    if PAYMENT_DETAILS_PATTERN.search(reply):
+        needs_deven = True
+        reason = reason or "They shared payment details; check nothing is repeated"
 
     return {
         "status": "success",
@@ -1147,6 +1223,7 @@ Write the reply and return ONLY the JSON object."""
         "needs_deven": needs_deven,
         "reason": reason,
         "flag": "⚠️ Needs your call" if needs_deven else "✅ Safe to send",
+        "below_minimum": below_minimum,
         "answered": answered,
         "unanswered": unanswered,
     }
@@ -1154,7 +1231,7 @@ Write the reply and return ONLY the JSON object."""
 
 @app.post("/agent/steve/draft-reply")
 async def steve_draft_reply(req: DraftReplyRequest):
-    """ANANYA: draft an answer to a brand's questions. Never sends; Deven approves in Slack."""
+    """ANANYA: draft a reply to any real brand reply. Never sends; Deven approves in Slack."""
     try:
         return await draft_question_reply("brand", req)
     except Exception as e:
@@ -1163,7 +1240,7 @@ async def steve_draft_reply(req: DraftReplyRequest):
 
 @app.post("/agent/aditya/draft-reply")
 async def aditya_draft_reply(req: DraftReplyRequest):
-    """ADITYA: draft an answer to a creator's questions. Never sends; Deven approves in Slack."""
+    """ADITYA: draft a reply to any real creator reply. Never sends; Deven approves in Slack."""
     try:
         return await draft_question_reply("creator", req)
     except Exception as e:
