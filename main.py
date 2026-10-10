@@ -262,6 +262,49 @@ def clean_json_text(response_text: str) -> str:
     return response_text.strip()
 
 
+_KEEP_LINE = re.compile(
+    r"^(?:[-•*]\s|\d+[.)]\s|[A-Z][A-Za-z /&]{0,30}:\s|P\.?S\.?|"
+    r"Ananya\b|Aditya\b|Brand Partnerships|Creator Manager|prabhaav\.co|Team Prabhaav|"
+    r"(?:Best|Warm|Kind)?\s*(?:regards|wishes|thanks|cheers)\b|Thanks\b|Thank you\b|If this isn't)",
+    re.IGNORECASE,
+)
+
+
+def clean_email_text(body: str) -> str:
+    """
+    Undo hard line wraps inside paragraphs (the 'gaps mid-sentence' problem in Gmail).
+    - A single line break after a long line is joined into one paragraph line
+    - Blank lines between paragraphs, bullets, numbered steps, 'Label: value' lines,
+      the subject line and the sign-off block are kept exactly as they are
+    """
+    if not body:
+        return body
+    text_value = str(body).replace("\r\n", "\n").replace("\r", "\n")
+    paragraphs = re.split(r"\n[ \t]*\n", text_value.strip())
+    cleaned = []
+    for para in paragraphs:
+        out = []
+        for line in para.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            prev = out[-1] if out else ""
+            join = (
+                prev
+                and len(prev) >= 45                      # previous line was cut by a wrap, not a short line
+                and not prev.endswith(":")               # "Here are the details:" stays on its own
+                and not prev.lower().startswith("subject:")
+                and not _KEEP_LINE.match(line)
+            )
+            if join:
+                out[-1] = prev + " " + line
+            else:
+                out.append(line)
+        if out:
+            cleaned.append("\n".join(out))
+    return re.sub(r"[ \t]{2,}", " ", "\n\n".join(cleaned))
+
+
 def parse_pitches(response_text: str, id_key: str, text_key: str = "pitch_email") -> list:
     """Parse Claude's JSON array, with repair fallbacks"""
     response_text = clean_json_text(response_text)
@@ -336,7 +379,7 @@ Do not skip anyone. Return ONLY the JSON array, no other text."""
                 pid = pitch.get(id_key)
                 # Keep only IDs we actually sent, first valid pitch wins
                 if pid in valid_ids and pid not in pitch_map and pitch.get(text_key):
-                    pitch_map[pid] = pitch[text_key]
+                    pitch_map[pid] = clean_email_text(pitch[text_key])
 
     # Pass 1: all batches in parallel
     batches = [items[i:i + BATCH_SIZE] for i in range(0, len(items), BATCH_SIZE)]
@@ -397,6 +440,8 @@ WRITING_STYLE = """HOW YOU WRITE
 - Lead with them, not with Prabhaav. One clear ask per email.
 - Never write "I hope this email finds you well", "just following up", "circling back" or "bumping this".
 - No emojis, no strings of exclamation marks, no ALL CAPS.
+- Write each paragraph as one continuous line. Never add line breaks inside a paragraph;
+  separate paragraphs with one blank line.
 """
 
 ANANYA_WRITING_STYLE = """HOW YOU WRITE
@@ -406,6 +451,8 @@ ANANYA_WRITING_STYLE = """HOW YOU WRITE
 - Never use hype words ("revolutionary", "game-changing", "synergy", "exciting opportunity"),
   "I hope this email finds you well", "just following up" or "circling back".
 - No emojis, no strings of exclamation marks, no ALL CAPS.
+- Write each paragraph as one continuous line. Never add line breaks inside a paragraph;
+  separate paragraphs with one blank line.
 """
 
 ANANYA_CORE = """You are Ananya, Brand Partnerships at Prabhaav. You are warm, sharp and curious about the
@@ -423,6 +470,8 @@ ADITYA_WRITING_STYLE = """HOW YOU WRITE
 - Never use hype words ("revolutionary", "game-changing", "exciting opportunity"),
   "Hope you're doing well!!", "just following up" or "circling back".
 - No emojis, no strings of exclamation marks, no ALL CAPS.
+- Write each paragraph as one continuous line. Never add line breaks inside a paragraph;
+  separate paragraphs with one blank line.
 """
 
 ADITYA_CORE = """You are Aditya, Creator Manager at Prabhaav. You respect creators and the work they put in.
@@ -902,6 +951,223 @@ async def aditya_parse_reply(request: ParseReplyRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error parsing creator reply: {str(e)}")
+
+
+# ============ QUESTION DRAFTS (Ananya + Aditya, approved by Deven in Slack) ============
+DRAFT_REPLY_RULES = """
+TASK: The contact replied to us with one or more questions. Write the reply email that answers them.
+Deven reads your draft in Slack and approves or edits it before anything is sent.
+
+How to answer:
+- Answer every question directly, in the order they were asked, using ONLY the facts in these
+  instructions and the ANSWER FACTS below. Plain words, no sales talk.
+- If they also shared details (budget, platform, rates, timeline), thank them briefly and don't ask for
+  those again. If something we still need is missing, ask for it in one easy line at the end.
+- If you cannot answer a question from the facts, do not guess. Write that you'll check and come back
+  to them shortly, and set needs_deven to true.
+- Greeting: "Hi <first name>," for a person, "Hi <brand name> team," for a brand without a name.
+- 60-150 words. No subject line (it is sent as a reply in the same thread).
+- Write each paragraph as one continuous line; separate paragraphs with one blank line.
+
+Set needs_deven to true (and still write your best safe draft) when the reply:
+- asks for a discount, a specific price, a rate change or anything about money not covered by the facts
+- asks to change payment terms, contract terms, exclusivity, timelines we haven't agreed, or for legal,
+  tax, GST or invoice details
+- is a complaint, is unhappy, or mentions a refund or a problem with a campaign
+- asks whether they are talking to a person or an AI (answer honestly: you are an AI assistant on the
+  Prabhaav team, and Deven, the founder, personally reviews every deal and every email before it goes out)
+- asks for creator names or handles before the advance, or asks for the brand's name before acceptance
+- asks anything you could not answer from the facts
+
+Return ONLY a valid JSON object, no other text:
+{
+  "draft": "Hi ...,\\n\\n...\\n\\n<sign-off>",
+  "needs_deven": false,
+  "reason": "Why Deven should look closely, in one short line, or null",
+  "answered": ["each question you answered"],
+  "unanswered": ["each question you could not answer from the facts"]
+}
+"""
+
+STEVE_DRAFT_PROMPT = ANANYA_CORE + DRAFT_REPLY_RULES + """
+Sign off exactly as:
+""" + ANANYA_SIGNOFF
+
+ADITYA_DRAFT_PROMPT = ADITYA_CORE + DRAFT_REPLY_RULES + """
+Sign off exactly as:
+""" + ADITYA_SIGNOFF
+
+
+def _pct(value) -> int:
+    return int(round(float(value) * 100))
+
+
+def brand_answer_facts(s: dict) -> str:
+    adv = _pct(s.get("advance_pct", 0.7))
+    return f"""ANSWER FACTS (for brands; you may state these)
+- Pricing: every campaign is priced from the brand's brief: platform, number and size of creators,
+  and deliverables. Once they share a rough budget, platform and timeline, we send a shortlist of
+  creators who fit, with prices, usually within 48 hours. Never give a number other than the minimum below.
+- Minimum campaign size: {format_inr(int(s.get("min_deal_inr", 5000)))}.
+- Budget: the brand's budget is a ceiling, not a target. We recommend fewer, better-fitting creators
+  rather than spending it all.
+- Lineups are anonymised (Creator A, B, C) with platform, followers, engagement, niche and why they fit.
+  Creator names and handles are shared once the advance is received.
+- Payment: {adv}% advance to confirm the lineup, the remaining {100 - adv}% before the content goes live.
+- The brand approves the content before anything is posted. No retainers, no lock-in: pay per campaign.
+- We handle everything: finding creators, briefing, content approval and creator payouts. One point of
+  contact, one invoice.
+- Creators clearly mark the content as a paid partnership, as ASCI guidelines require.
+"""
+
+
+def creator_answer_facts(s: dict) -> str:
+    first = _pct(s.get("creator_first_payment_pct", 0.3))
+    hmin = int(s.get("creator_final_payment_hours_min", 48))
+    hmax = int(s.get("creator_final_payment_hours_max", 58))
+    kill = _pct(s.get("kill_fee_pct", 0.5))
+    return f"""ANSWER FACTS (for creators; you may state these)
+- Joining is completely free. We never charge creators anything. Brands pay Prabhaav, and Prabhaav pays
+  the creator's payout.
+- How it works: when a campaign fits their niche and audience, they get an offer email with the brand's
+  category, the deliverables, the deadline and their payout. They choose which offers to accept.
+- The brand's name and the full brief are shared once they accept and the brand confirms.
+- Payout timing: {first}% once the brand approves their content, and the remaining {100 - first}%
+  within {hmin}-{hmax} hours after the post goes live.
+- If a brand cancels for its own reasons after they've made content that meets the brief, they receive
+  {kill}% of the payout.
+- They can counter an offer by replying with what works for them; Deven reviews every counter.
+- Paid posts must be marked as a paid partnership (#ad or the platform's label), as ASCI requires.
+- Payment details are collected separately by Deven, never over this email thread.
+"""
+
+
+class DraftReplyRequest(BaseModel):
+    contact_id: str                         # brand_id or creator_id
+    contact_name: Optional[str] = None
+    from_email: Optional[str] = None
+    reply_subject: Optional[str] = None
+    reply_body: str                         # their latest email
+    questions: Optional[List[str]] = None   # from parse-reply; optional
+    summary: Optional[str] = None           # from parse-reply; optional
+    original_pitch: Optional[str] = None
+
+    @field_validator("questions", mode="before")
+    @classmethod
+    def _to_list(cls, v):
+        # n8n sometimes sends a JSON string or a single string instead of a list
+        if v in (None, ""):
+            return None
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except json.JSONDecodeError:
+                return [v]
+        if isinstance(v, list):
+            return [str(x) for x in v if str(x).strip()]
+        return [str(v)]
+
+
+def _contact_profile(contact_type: str, contact_id: str) -> str:
+    """A few known facts about the contact from Supabase. Empty if anything goes wrong."""
+    try:
+        if contact_type == "brand":
+            sql = "SELECT brand_name AS name, industry, basic_info, status FROM brands WHERE brand_id = :id"
+        else:
+            sql = ("SELECT creator_name AS name, platform, niche, basic_info, min_budget, status "
+                   "FROM creators WHERE creator_id = :id")
+        with engine.connect() as conn:
+            row = conn.execute(text(sql), {"id": contact_id}).mappings().first()
+        if not row:
+            return ""
+        return "\n".join(f"- {k}: {v}" for k, v in dict(row).items() if v not in (None, ""))
+    except Exception as e:
+        print(f"Profile lookup failed for {contact_type} {contact_id}: {e}")
+        return ""
+
+
+SENSITIVE_PATTERN = re.compile(
+    r"discount|negotiat|cheaper|lower (?:the )?price|refund|complain|unhappy|disappoint|lawyer|legal|"
+    r"contract|agreement|invoice|gst|tds|\bbot\b|\bai\b|automated|real person|human",
+    re.IGNORECASE,
+)
+
+
+async def draft_question_reply(contact_type: str, req: DraftReplyRequest) -> dict:
+    s = load_settings()
+    is_brand = contact_type == "brand"
+    prompt = (STEVE_DRAFT_PROMPT if is_brand else ADITYA_DRAFT_PROMPT) + "\n\n" + (
+        brand_answer_facts(s) if is_brand else creator_answer_facts(s))
+    reply = strip_quoted_reply(req.reply_body)
+    profile = _contact_profile(contact_type, req.contact_id)
+    questions = "\n".join(f"- {q}" for q in (req.questions or [])) or "(not extracted; read the reply)"
+    message = f"""{'BRAND' if is_brand else 'CREATOR'}: {req.contact_name or req.contact_id}
+From: {req.from_email or 'unknown'}
+Subject: {req.reply_subject or ''}
+{('WHAT WE KNOW ABOUT THEM:' + chr(10) + profile + chr(10)) if profile else ''}
+{('OUR ORIGINAL EMAIL (for context):' + chr(10) + req.original_pitch[:1500] + chr(10)) if req.original_pitch else ''}
+THEIR LATEST REPLY:
+{reply}
+
+QUESTIONS THEY ASKED:
+{questions}
+
+Write the reply and return ONLY the JSON object."""
+
+    signoff = ANANYA_SIGNOFF if is_brand else ADITYA_SIGNOFF
+    try:
+        parsed = parse_json_object(await call_claude(prompt, message))
+        draft = clean_email_text(str(parsed.get("draft") or "").strip())
+        if not draft:
+            raise ValueError("empty draft")
+        needs_deven = bool(parsed.get("needs_deven"))
+        reason = clean_text(parsed.get("reason"))
+        unanswered = [str(x) for x in (parsed.get("unanswered") or []) if str(x).strip()]
+        answered = [str(x) for x in (parsed.get("answered") or []) if str(x).strip()]
+    except Exception as e:
+        print(f"Question draft failed for {contact_type} {req.contact_id}: {e}")
+        first = (req.contact_name or "").split()[0] if (req.contact_name and not is_brand) else None
+        greet = f"Hi {first}," if first else (f"Hi {req.contact_name} team," if req.contact_name else "Hi,")
+        draft = (f"{greet}\n\nThanks for your questions. I'm checking the details and will come back to you "
+                 f"shortly.\n\n{signoff}")
+        needs_deven, reason, answered, unanswered = True, "AI draft failed; holding reply sent instead", [], req.questions or []
+
+    # Belt and braces: money, legal, complaints and AI questions always get a closer look
+    if not needs_deven and SENSITIVE_PATTERN.search(reply):
+        needs_deven = True
+        reason = reason or "Reply mentions money, terms, a complaint or AI; please check the draft"
+    if unanswered and not needs_deven:
+        needs_deven, reason = True, reason or "Some questions couldn't be answered from the facts"
+
+    return {
+        "status": "success",
+        "contact_type": contact_type,
+        "contact_id": req.contact_id,
+        "draft": draft,
+        "needs_deven": needs_deven,
+        "reason": reason,
+        "flag": "⚠️ Needs your call" if needs_deven else "✅ Safe to send",
+        "answered": answered,
+        "unanswered": unanswered,
+    }
+
+
+@app.post("/agent/steve/draft-reply")
+async def steve_draft_reply(req: DraftReplyRequest):
+    """ANANYA: draft an answer to a brand's questions. Never sends; Deven approves in Slack."""
+    try:
+        return await draft_question_reply("brand", req)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error drafting brand reply: {str(e)}")
+
+
+@app.post("/agent/aditya/draft-reply")
+async def aditya_draft_reply(req: DraftReplyRequest):
+    """ADITYA: draft an answer to a creator's questions. Never sends; Deven approves in Slack."""
+    try:
+        return await draft_question_reply("creator", req)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error drafting creator reply: {str(e)}")
 
 
 # ============ CAMPAIGNS ============
@@ -2884,7 +3150,7 @@ CREATORS THEY WANT TO REMOVE:
                  f"\n\nAnanya\nBrand Partnerships, Prabhaav\nprabhaav.co")
     for r in rejected:
         draft = _anonymize(draft, r)
-    return draft
+    return clean_email_text(draft)
 
 
 class LineupReplyRequest(BaseModel):
