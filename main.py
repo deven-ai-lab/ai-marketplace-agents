@@ -820,7 +820,10 @@ Format:
 ADITYA_PARSE_PROMPT = ADITYA_CORE + """
 You sent a pitch email to a creator and they replied. Read the reply and extract structured data.
 """ + REPLY_RULES + """
-For min_budget, use the lowest amount the creator says they accept per collaboration.
+For min_budget, use their rate for ONE main deliverable on their main platform (one Instagram Reel,
+one YouTube video), not the cheapest add-on such as a single Story. If they give a range, use the lower end.
+If they give only one rate, use that. Copy their full rate card, word for word, into budget_text, and
+summarise it in notes (e.g. "Rate card: Story 1500, Reel 15000, Reel + 3 Stories 15000-18000").
 For niche, use the reply, or our original pitch if it clearly states their niche.
 For location, audience_type and languages, only use what the reply says.
 
