@@ -1055,7 +1055,9 @@ def creator_answer_facts(s: dict) -> str:
   the creator's payout.
 - How it works: when a campaign fits their niche and audience, they get an offer email with the brand's
   category, the deliverables, the deadline and their payout. They choose which offers to accept.
-- The brand's name and the full brief are shared once they accept and the brand confirms.
+- The brand's name is shared as soon as they accept the offer. The full brief follows once the brand
+  confirms and pays. By accepting, they agree not to work directly with that brand, outside Prabhaav,
+  for the agreed period (stated in the offer).
 - Payout timing: {first}% once the brand approves their content, and the remaining {100 - first}%
   within {hmin}-{hmax} hours after the post goes live.
 - If a brand cancels for its own reasons after they've made content that meets the brief, they receive
@@ -1080,6 +1082,8 @@ class DraftReplyRequest(BaseModel):
     intent: Optional[str] = None            # from parse-reply; optional
     extracted: Optional[dict] = None        # parse-reply's extracted_data; optional
     original_pitch: Optional[str] = None
+    history: Optional[str] = None           # earlier emails in this conversation, oldest first
+    context: Optional[str] = None           # where the deal stands (offer, lineup) and extra rules
 
     @field_validator("extracted", mode="before")
     @classmethod
@@ -1175,6 +1179,8 @@ From: {req.from_email or 'unknown'}
 Subject: {req.reply_subject or ''}
 {('WHAT WE KNOW ABOUT THEM:' + chr(10) + profile + chr(10)) if profile else ''}
 {('OUR ORIGINAL EMAIL (for context):' + chr(10) + req.original_pitch[:1500] + chr(10)) if req.original_pitch else ''}
+{('EARLIER EMAILS IN THIS CONVERSATION (oldest first):' + chr(10) + req.history + chr(10)) if req.history else ''}
+{('WHERE THE DEAL STANDS:' + chr(10) + req.context + chr(10)) if req.context else ''}
 THEIR LATEST REPLY:
 {reply}
 
@@ -1251,6 +1257,24 @@ async def aditya_draft_reply(req: DraftReplyRequest):
 
 
 # ============ CAMPAIGNS ============
+def brand_wants_exclusivity(requirements) -> bool:
+    """True when the brand's brief asks for creator exclusivity"""
+    return bool(requirements) and bool(re.search(r"exclusiv|not work with (?:any )?competitor|no competitor",
+                                                 str(requirements), re.IGNORECASE))
+
+
+def offer_exclusivity_days(amount, campaign_exclusivity_days, s: dict) -> int:
+    """
+    Exclusivity rule:
+    - the brand asked for it  -> the campaign's exclusivity applies to every creator
+    - otherwise only when the creator's payout is above exclusivity_min_payout_inr (default 25,000)
+    """
+    if campaign_exclusivity_days:
+        return int(campaign_exclusivity_days)
+    threshold = float(s.get("exclusivity_min_payout_inr", 25000))
+    return int(s.get("exclusivity_days", 30)) if amount and float(amount) > threshold else 0
+
+
 BRIEF_FIELDS = [
     "pricing_model", "total_budget", "rate_per_collab", "slots", "budget_text",
     "platform", "niche", "target_audience", "location_requirement",
@@ -1307,9 +1331,12 @@ async def upsert_campaign_from_brief(req: CampaignFromBriefRequest):
             req.rate_per_collab * (req.slots or 1) if req.rate_per_collab else None
         )
         terms = {"exclusivity_days": None, "revisions_allowed": None}
+        # Campaign-wide exclusivity only when the brand asks for it. Otherwise each offer decides
+        # on its own payout (see offer_exclusivity_days). None keeps whatever is already saved.
+        if brand_wants_exclusivity(req.requirements):
+            terms["exclusivity_days"] = int(s.get("exclusivity_days", 30))
         if deal_value:
             is_small = deal_value < s.get("small_deal_threshold_inr", 25000)
-            terms["exclusivity_days"] = 0 if is_small else int(s.get("exclusivity_days", 30))
             terms["revisions_allowed"] = int(
                 s.get("revisions_small", 1) if is_small else s.get("revisions_campaign", 2)
             )
@@ -1500,7 +1527,7 @@ async def fred_match(request: FredMatchRequest):
             creators = [dict(r) for r in conn.execute(text("""
                 SELECT creator_id, creator_name, platform, handle, basic_info, follower_count,
                        engagement_rate, comments, min_budget, restrictions, availability,
-                       best_format, niche, location, audience_type, languages
+                       best_format, niche, location, audience_type, languages, rate_card
                 FROM creators
                 WHERE COALESCE(unsubscribed, FALSE) = FALSE
                   AND COALESCE(response_intent, '') NOT IN ('not_interested', 'unsubscribe')
@@ -1518,8 +1545,8 @@ async def fred_match(request: FredMatchRequest):
                 JOIN brands b ON b.brand_id = c.brand_id
                 WHERE o.status = 'accepted'
                   AND c.brand_id <> :brand_id
-                  AND COALESCE(c.exclusivity_days, 0) > 0
-                  AND c.updated_at > NOW() - make_interval(days => c.exclusivity_days)
+                  AND COALESCE(o.exclusivity_days, 0) > 0
+                  AND c.updated_at > NOW() - make_interval(days => o.exclusivity_days)
                   AND :industry <> ''
                   AND LOWER(COALESCE(b.industry, '')) = LOWER(:industry)
             """), {"brand_id": campaign["brand_id"],
@@ -1626,7 +1653,8 @@ Other requirements: {val(campaign['requirements'])}"""
 - Location: {val(c['location'])}
 - Audience: {val(c['audience_type'])}
 - Languages: {val(c['languages'])}
-- Rate: {('INR ' + str(c['min_budget']) + ' minimum') if c['min_budget'] is not None else 'unknown'}
+- Rate: {('INR ' + str(c['min_budget']) + ' for one main post (e.g. a Reel)') if c['min_budget'] is not None else 'unknown'}
+- Rate card: {val(c.get('rate_card'))}
 - Restrictions: {val(c['restrictions'])}
 - Availability: {val(c['availability'])}
 - Best format: {val(c['best_format'])}"""
@@ -2168,11 +2196,14 @@ def build_offer_terms(amount, deliverables, platform, deadline, revisions, exclu
         category = (industry or "competing").strip()
         lines.append(f"• Exclusivity: no posts for competing {category} brands for {exclusivity_days} days after publishing")
     lines.append(f"• Cancellation: if the brand cancels for its own reasons after you've created content that meets the brief, you receive {kill_fee}% of the payout in total. If the content doesn't meet the brief after the agreed revisions, no payment is due")
+    months = int(s.get("non_circumvention_months", 12))
+    lines.append(f"• Working through Prabhaav: if you accept, you agree not to work directly with this brand, "
+                 f"outside Prabhaav, for {months} months")
     lines.append(f"• This offer is open until {expires_at.astimezone(IST).strftime('%d %b, %I:%M %p')} IST")
     lines += [
         "",
         'To confirm, just reply "Accept". If you\'d like to discuss the payout or anything else, reply with what works for you.',
-        "We'll share the brand's name and the full brief as soon as you accept.",
+        "We'll share the brand's name as soon as you accept, and the full brief once the brand confirms.",
         "",
         "Aditya",
         "Creator Manager, Prabhaav",
@@ -2371,9 +2402,10 @@ async def prepare_offers(req: OfferPrepareRequest):
                 intro, deliverable = _split_deliverable(intro)
                 deliverable = deliverable or campaign["deliverables"]
                 creator_platform = _creator_platform(c["platform"], campaign["platform"])
+                excl_days = offer_exclusivity_days(amount, campaign["exclusivity_days"], s)
                 terms = build_offer_terms(
                     amount, deliverable, creator_platform, deadline,
-                    campaign["revisions_allowed"], campaign["exclusivity_days"],
+                    campaign["revisions_allowed"], excl_days,
                     campaign["industry"], expires_at, s
                 )
                 body = _strip_brand(intro.strip(), campaign["brand_name"]) + "\n\n" + terms
@@ -2393,7 +2425,7 @@ async def prepare_offers(req: OfferPrepareRequest):
                     "amount": amount, "share": rate,
                     "margin": round(1 - amount / rate, 3) if rate else None,
                     "deliverables": deliverable, "deadline": deadline,
-                    "exclusivity": campaign["exclusivity_days"],
+                    "exclusivity": excl_days,
                     "expires_at": expires_at.replace(tzinfo=None),
                     "subject": subject, "body": body,
                 })
@@ -2468,15 +2500,21 @@ INTENT (pick exactly one):
 - "counter": asks for a different payout, or accepts only if the payout changes
 - "question": asks something, or adds conditions (dates, deliverables, advance, brand name)
   without clearly accepting or declining
+- "interested": positive ("I'm interested", "sounds good", "would love to") but has NOT clearly said
+  yes to this exact offer, and asks nothing else
 - "auto_reply": out-of-office or automated message
 - "unsubscribe": asks not to be contacted again
 
 counter_amount: the payout they ask for, as an integer in INR ("12k" = 12000, "1.5L" = 150000), else null.
 Never guess an amount.
 
+Also pull out profile facts if they share them (else null): rate_card (their prices, word for word),
+restrictions (categories they won't promote), availability. Never copy bank, UPI, PAN or Aadhaar details.
+
 Return ONLY a JSON object, no other text:
 {"intent": "accept", "counter_amount": null, "reason": "short reason if they declined, else null",
- "questions": ["any questions they asked"], "summary": "one sentence for the founder"}
+ "questions": ["any questions they asked"], "summary": "one sentence for the founder",
+ "rate_card": null, "restrictions": null, "availability": null}
 """
 
 OFFER_INTENTS = {"accept", "decline", "counter", "question", "auto_reply", "unsubscribe"}
@@ -2496,6 +2534,8 @@ def build_acceptance_email(first_name, brand_name, deliverable, deadline, amount
 {opening}
 
 The brand is {brand_name}. You're now on the final creator lineup we're presenting to them, and we'll confirm with you shortly.
+
+As agreed in the offer, please keep all work with {brand_name} through Prabhaav for the next {int(s.get("non_circumvention_months", 12))} months, rather than directly with the brand.
 
 Here's a recap of what you accepted:
 • Deliverables: {deliverable or 'to be confirmed with the brief'}
@@ -4175,6 +4215,768 @@ async def get_creators():
 async def get_revenue_analytics():
     """Get revenue analytics"""
     return {"status": "analytics_endpoint", "message": "Analytics implementation pending"}
+
+
+# ============ INBOX AGENT (one place for every incoming reply) ============
+# /inbox/handle  reads a reply, saves safe facts, and PLANS the next step (nothing big happens yet)
+# /inbox/approve carries out the plan after Deven approves the Slack card
+#
+# Safe facts (rates, budget, restrictions, the brief) are saved straight away.
+# Anything that sends an email, changes a deal or starts the next step waits for approval.
+# Counters, brand rejections and brand declines go to their existing Slack review workflows.
+
+OUR_DOMAINS = ("@teamprabhaav.com", "@prabhaav.co")
+HISTORY_EMAILS = 6          # earlier emails the agent rereads (keeps cost flat on long threads)
+
+
+def _ensure_inbox_tables():
+    """Create the approvals table and the rate-card column if they don't exist yet"""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS pending_actions (
+                    action_id TEXT PRIMARY KEY,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    status TEXT DEFAULT 'pending',
+                    inbox TEXT,
+                    stage TEXT,
+                    contact_type TEXT,
+                    contact_id TEXT,
+                    contact_name TEXT,
+                    campaign_id TEXT,
+                    offer_id TEXT,
+                    gmail_thread_id TEXT,
+                    reply_to_message_id TEXT,
+                    summary TEXT,
+                    draft TEXT,
+                    plan JSONB,
+                    decision TEXT,
+                    final_email TEXT,
+                    decided_at TIMESTAMPTZ
+                )
+            """))
+            conn.execute(text("ALTER TABLE creators ADD COLUMN IF NOT EXISTS rate_card TEXT"))
+            for t in ("brands", "creators"):
+                conn.execute(text(f"ALTER TABLE {t} ADD COLUMN IF NOT EXISTS response_date TIMESTAMPTZ"))
+                conn.execute(text(f"ALTER TABLE {t} ADD COLUMN IF NOT EXISTS response_message TEXT"))
+    except Exception as e:
+        print(f"Inbox tables check failed: {e}")
+
+
+_ensure_inbox_tables()
+
+
+class InboxMessage(BaseModel):
+    inbox: str                                  # "ananya" or "aditya": the inbox that received it
+    gmail_message_id: str
+    gmail_thread_id: Optional[str] = None
+    from_email: Optional[str] = None
+    from_name: Optional[str] = None
+    subject: Optional[str] = None
+    body: Optional[str] = ""
+
+
+def _find_context(conn, msg: InboxMessage) -> dict:
+    """Which conversation is this? lineup (brand) > offer (creator) > pitch (brand or creator)"""
+    t = msg.gmail_thread_id
+    if t:
+        c = conn.execute(text("""
+            SELECT c.*, b.brand_name, b.email AS brand_email FROM campaigns c
+            JOIN brands b ON b.brand_id = c.brand_id
+            WHERE c.gmail_thread_id = :t AND c.status IN ('shortlist_sent', 'confirmed')
+            ORDER BY c.id DESC LIMIT 1
+        """), {"t": t}).mappings().first()
+        if c:
+            if msg.gmail_message_id == c.get("lineup_message_id"):
+                return {"stage": "own"}
+            return {"stage": "lineup", "contact_type": "brand", "contact_id": c["brand_id"],
+                    "contact_name": c["brand_name"], "campaign": dict(c)}
+
+        o = conn.execute(text("""
+            SELECT o.*, cr.creator_name, c.pricing_model, c.rate_per_collab, c.total_budget, c.slots,
+                   c.margin_target, c.margin_floor, c.status AS campaign_status, b.brand_name, b.industry
+            FROM offers o
+            JOIN creators cr ON cr.creator_id = o.creator_id
+            JOIN campaigns c ON c.campaign_id = o.campaign_id
+            JOIN brands b ON b.brand_id = c.brand_id
+            WHERE o.gmail_thread_id = :t AND o.status <> 'draft'
+            ORDER BY o.round DESC LIMIT 1
+        """), {"t": t}).mappings().first()
+        if o:
+            if msg.gmail_message_id == o.get("gmail_message_id"):
+                return {"stage": "own"}
+            return {"stage": "offer", "contact_type": "creator", "contact_id": o["creator_id"],
+                    "contact_name": o["creator_name"], "offer": dict(o)}
+
+        for ctype, table, idc, namec in (("brand", "brands", "brand_id", "brand_name"),
+                                         ("creator", "creators", "creator_id", "creator_name")):
+            r = conn.execute(text(f"""
+                SELECT {idc} AS id, {namec} AS name, gmail_message_id FROM {table}
+                WHERE gmail_thread_id = :t LIMIT 1
+            """), {"t": t}).mappings().first()
+            if r:
+                if msg.gmail_message_id == r["gmail_message_id"]:
+                    return {"stage": "own"}
+                return {"stage": "pitch", "contact_type": ctype, "contact_id": r["id"], "contact_name": r["name"]}
+
+    # New thread from a known contact: match on their email address
+    email = (msg.from_email or "").strip().lower()
+    if email:
+        for ctype, table, idc, namec in (("brand", "brands", "brand_id", "brand_name"),
+                                         ("creator", "creators", "creator_id", "creator_name")):
+            r = conn.execute(text(f"""
+                SELECT {idc} AS id, {namec} AS name FROM {table} WHERE LOWER(TRIM(email)) = :e LIMIT 1
+            """), {"e": email}).mappings().first()
+            if r:
+                return {"stage": "pitch", "contact_type": ctype, "contact_id": r["id"], "contact_name": r["name"],
+                        "new_thread": True}
+    return {"stage": "unknown"}
+
+
+def _history(conn, contact_type: str, contact_id: str, exclude_message_id: str) -> str:
+    """The last few emails with this contact, oldest first, trimmed so cost stays flat"""
+    rows = conn.execute(text("""
+        SELECT direction, subject, body, created_at FROM conversations
+        WHERE contact_type = :ct AND contact_id = :cid AND gmail_message_id IS DISTINCT FROM :m
+        ORDER BY created_at DESC LIMIT :n
+    """), {"ct": contact_type, "cid": contact_id, "m": exclude_message_id, "n": HISTORY_EMAILS}).mappings().all()
+    parts = []
+    if contact_type == "brand":
+        first = conn.execute(text("SELECT pitch_email FROM brands WHERE brand_id = :c"), {"c": contact_id}).scalar()
+    else:
+        first = conn.execute(text("SELECT CONCAT_WS(E'\\n\\n', pitch_subject, pitch_body) FROM creators "
+                                  "WHERE creator_id = :c"), {"c": contact_id}).scalar()
+    if first:
+        parts.append(f"OUR FIRST EMAIL: {first[:1200]}")
+    for r in reversed(rows):
+        who = "THEM" if r["direction"] == "inbound" else "US"
+        body = strip_quoted_reply(r["body"] or "")[:900]
+        when = r["created_at"].strftime("%d %b") if r["created_at"] else ""
+        parts.append(f"[{when}] {who}: {body}")
+    return "\n\n".join(parts)
+
+
+def _log_inbound(conn, ctype, cid, msg: InboxMessage, intent, data) -> int:
+    return conn.execute(text("""
+        INSERT INTO conversations (contact_type, contact_id, gmail_thread_id, gmail_message_id,
+                                   direction, from_email, subject, body, intent, extracted_data)
+        VALUES (:ct, :cid, :thread, :msg, 'inbound', :from_email, :subject, :body, :intent, CAST(:data AS JSONB))
+        ON CONFLICT (gmail_message_id) DO NOTHING
+    """), {"ct": ctype, "cid": cid, "thread": msg.gmail_thread_id, "msg": msg.gmail_message_id,
+           "from_email": msg.from_email, "subject": msg.subject, "body": msg.body,
+           "intent": intent, "data": json.dumps(data or {}, default=str)}).rowcount
+
+
+def _save_creator_facts(conn, creator_id: str, facts: dict) -> list:
+    """Save only the fields that were actually shared. Returns a readable list of what was saved."""
+    allowed = ["min_budget", "restrictions", "availability", "best_format", "niche", "location",
+               "audience_type", "languages", "rate_card"]
+    upd = {k: facts[k] for k in allowed if facts.get(k) not in (None, "", [])}
+    if not upd:
+        return []
+    set_clause = ", ".join(f"{k} = :{k}" for k in upd)
+    conn.execute(text(f"UPDATE creators SET {set_clause} WHERE creator_id = :cid"), {**upd, "cid": creator_id})
+    labels = {"min_budget": "rate", "rate_card": "rate card", "best_format": "best format",
+              "audience_type": "audience"}
+    return [f"{labels.get(k, k)}: {format_inr(v) if k == 'min_budget' else v}" for k, v in upd.items()]
+
+
+def _set_log(conn, msg: InboxMessage, intent, data):
+    conn.execute(text("UPDATE conversations SET intent = :i, extracted_data = CAST(:d AS JSONB) "
+                      "WHERE gmail_message_id = :m"),
+                 {"i": intent, "d": json.dumps(data or {}, default=str), "m": msg.gmail_message_id})
+
+
+def _quote(body: str, lines: int = 10) -> str:
+    kept = [l for l in strip_quoted_reply(body or "").splitlines() if l.strip()][:lines]
+    return "\n".join("> " + l for l in kept) or "> (empty)"
+
+
+ACTION_LABELS = {
+    "start_fred": "Start Fred matching for this campaign",
+    "accept_offer": "Mark the offer as accepted",
+    "decline_offer": "Close the offer and send it to the next approved creator",
+    "reopen_offer": "Reopen the expired offer",
+    "confirm_lineup": "Mark the lineup confirmed and wait for the advance",
+}
+
+
+def _card(ctx: dict, msg: InboxMessage, summary: str, flag: str, reason, actions: list,
+          draft, saved: list, notes: list) -> str:
+    who = "Brand" if ctx["contact_type"] == "brand" else "Creator"
+    stage = {"pitch": "reply", "offer": "offer reply", "lineup": "lineup reply"}[ctx["stage"]]
+    agent = "Ananya" if ctx["contact_type"] == "brand" else "Aditya"
+    out = [f"{flag} *{who} {stage}: {ctx['contact_name']}*", summary or ""]
+    if reason:
+        out.append(f"_{reason}_")
+    out += ["", "*They wrote:*", _quote(msg.body)]
+    if saved:
+        out += ["", "*Saved to their profile:* " + "; ".join(saved)]
+    for n in notes:
+        out.append(n)
+    out += ["", "*If you approve:*"]
+    if draft:
+        out.append(f"• Send {agent}'s reply below")
+    for a in actions:
+        out.append("• " + a.get("label", ACTION_LABELS.get(a["type"], a["type"])))
+    if not draft and not actions:
+        out.append("• Nothing to send. Just noting it")
+    if draft:
+        out += ["", f"*{agent}'s draft:*", f"```{draft}```"]
+    return "\n".join(out)
+
+
+def _offer_context(o: dict, s: dict) -> str:
+    deadline = o["deadline"].strftime("%d %b %Y") if o.get("deadline") else "to be confirmed with the brief"
+    expires = o["expires_at"].strftime("%d %b, %H:%M") if o.get("expires_at") else "n/a"
+    return (f"We sent this creator a paid offer for an anonymous {o.get('industry') or ''} brand "
+            f"(never reveal the brand name before they accept).\n"
+            f"- Offer status: {o['status']}\n- Payout: {format_inr(o['offered_amount'])}\n"
+            f"- Deliverables: {o.get('deliverables') or 'as per the brief'}\n- Content deadline: {deadline}\n"
+            f"- Payment: {creator_payment_terms(o['offered_amount'], s)}\n- Offer open until: {expires} UTC\n"
+            f"If they sound positive but haven't clearly accepted, end by asking them to reply \"Accept\" "
+            f"to confirm. Never change the payout yourself.")
+
+
+def _lineup_context(c: dict, s: dict) -> str:
+    pct = int(float(s.get("advance_pct", 0.7)) * 100)
+    return (f"We sent this brand an anonymised creator lineup (Creator A, B, ...).\n"
+            f"- Campaign status: {c['status']}\n"
+            f"- Total price: {format_inr(c.get('final_brand_price') or 0)}; advance {pct}% "
+            f"({format_inr(c.get('advance_amount') or 0)}), the rest before content goes live\n"
+            f"Creator names and handles are shared only after the advance is received. "
+            f"If they want to go ahead, ask them to reply confirming the lineup.")
+
+
+def _save_pending(conn, action_id, msg, ctx, summary, draft, plan, campaign_id=None, offer_id=None):
+    conn.execute(text("""
+        INSERT INTO pending_actions (action_id, inbox, stage, contact_type, contact_id, contact_name,
+            campaign_id, offer_id, gmail_thread_id, reply_to_message_id, summary, draft, plan)
+        VALUES (:aid, :inbox, :stage, :ct, :cid, :cname, :camp, :oid, :thread, :reply_to, :summary, :draft,
+                CAST(:plan AS JSONB))
+    """), {"aid": action_id, "inbox": msg.inbox, "stage": ctx["stage"], "ct": ctx["contact_type"],
+           "cid": ctx["contact_id"], "cname": ctx["contact_name"], "camp": campaign_id, "oid": offer_id,
+           "thread": msg.gmail_thread_id, "reply_to": msg.gmail_message_id, "summary": summary,
+           "draft": draft, "plan": json.dumps(plan, default=str)})
+
+
+def _empty_result(msg: InboxMessage, status="success") -> dict:
+    return {"status": status, "inbox": msg.inbox, "stage": None, "needs_approval": False,
+            "action_id": None, "card_text": None, "slack_note": None,
+            "start_counter_review": False, "offer_id": None, "counter_text": None,
+            "start_rejection_review": False, "start_close_review": False, "campaign_id": None,
+            "rejection_prompt": None, "rejection_draft": None, "close_prompt": None, "close_reason": None}
+
+
+@app.post("/inbox/handle")
+async def inbox_handle(msg: InboxMessage):
+    """Read one incoming email, save safe facts, and plan the next step for Deven to approve"""
+    try:
+        s = load_settings()
+        result = _empty_result(msg)
+        sender = (msg.from_email or "").lower()
+        if any(sender.endswith(d) for d in OUR_DOMAINS):
+            return {**result, "status": "skipped", "slack_note": None}
+
+        with engine.connect() as conn:
+            if conn.execute(text("SELECT 1 FROM conversations WHERE gmail_message_id = :m"),
+                            {"m": msg.gmail_message_id}).first():
+                return {**result, "status": "duplicate"}
+            ctx = _find_context(conn, msg)
+            if ctx["stage"] in ("pitch", "offer", "lineup"):
+                history = _history(conn, ctx["contact_type"], ctx["contact_id"], msg.gmail_message_id)
+        if ctx["stage"] == "own":
+            return {**result, "status": "skipped"}
+        if ctx["stage"] == "unknown":
+            return {**result, "status": "unknown_sender",
+                    "slack_note": f"📭 Email in {msg.inbox}'s inbox from someone not in our lists: "
+                                  f"{msg.from_name or ''} <{msg.from_email}> · {msg.subject or ''}. Reply manually if needed."}
+
+        result["stage"] = ctx["stage"]
+        # Claim this email first, so two runs can never both handle it
+        with engine.begin() as conn:
+            if not _log_inbound(conn, ctx["contact_type"], ctx["contact_id"], msg, "received", {}):
+                return {**result, "status": "duplicate"}
+        try:
+            if ctx["stage"] == "pitch":
+                plan = await _plan_pitch_reply(msg, ctx, history, s)
+            elif ctx["stage"] == "offer":
+                plan = await _plan_offer_reply(msg, ctx, history, s)
+            else:
+                plan = await _plan_lineup_reply(msg, ctx, history, s)
+        except Exception:
+            # Release the claim so the email can be handled again once the problem is fixed
+            with engine.begin() as conn:
+                conn.execute(text("DELETE FROM conversations WHERE gmail_message_id = :m AND direction = 'inbound'"),
+                             {"m": msg.gmail_message_id})
+            raise
+
+        result.update(plan.pop("immediate", {}))
+        if plan.get("needs_approval"):
+            action_id = f"ACT_{uuid.uuid4().hex[:12]}"
+            with engine.begin() as conn:
+                _save_pending(conn, action_id, msg, ctx, plan["summary"], plan["draft"], plan["actions"],
+                              plan.get("campaign_id"), plan.get("offer_id"))
+            result.update({"needs_approval": True, "action_id": action_id,
+                           "card_text": _card(ctx, msg, plan["summary"], plan["flag"], plan.get("reason"),
+                                              plan["actions"], plan["draft"], plan.get("saved", []),
+                                              plan.get("notes", []))})
+        result["slack_note"] = plan.get("slack_note")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error handling inbox message: {str(e)}")
+
+
+async def _draft_for(ctx, msg, history, s, summary="", intent="", questions=None, extracted=None, context=None):
+    req = DraftReplyRequest(
+        contact_id=ctx["contact_id"], contact_name=ctx["contact_name"], from_email=msg.from_email,
+        reply_subject=msg.subject, reply_body=msg.body or "", questions=questions or [], summary=summary,
+        intent=intent, extracted=extracted, history=history or None, context=context)
+    return await draft_question_reply(ctx["contact_type"], req)
+
+
+async def _plan_pitch_reply(msg, ctx, history, s) -> dict:
+    is_brand = ctx["contact_type"] == "brand"
+    preq = ParseReplyRequest(contact_id=ctx["contact_id"], contact_name=ctx["contact_name"],
+                             from_email=msg.from_email, reply_subject=msg.subject, reply_body=msg.body or "",
+                             original_pitch=history or None)
+    parsed = await (steve_parse_reply(preq) if is_brand else aditya_parse_reply(preq))
+    intent = parsed["intent"]
+    saved, notes, actions, immediate = [], [], [], {}
+    campaign_id = None
+
+    with engine.begin() as conn:
+        _set_log(conn, msg, intent, parsed.get("extracted_data"))
+        if intent != "auto_reply":
+            unsub = intent == "unsubscribe"
+            table, idc = ("brands", "brand_id") if is_brand else ("creators", "creator_id")
+            conn.execute(text(f"""
+                UPDATE {table} SET response_received = TRUE, response_date = NOW(), response_intent = :intent,
+                       response_message = :summary,
+                       status = CASE WHEN :unsub THEN 'unsubscribed' ELSE 'responded' END,
+                       unsubscribed = CASE WHEN :unsub THEN TRUE ELSE unsubscribed END
+                WHERE {idc} = :cid
+            """), {"intent": intent, "summary": parsed.get("summary"), "unsub": unsub, "cid": ctx["contact_id"]})
+            if not is_brand:
+                facts = {k: parsed.get(k) for k in ["min_budget", "restrictions", "availability", "best_format",
+                                                    "niche", "location", "audience_type", "languages"]}
+                facts["rate_card"] = parsed.get("budget_text")
+                saved = _save_creator_facts(conn, ctx["contact_id"], facts)
+
+    who = "Brand" if is_brand else "Creator"
+    if intent == "auto_reply":
+        return {"needs_approval": False}
+    if intent == "unsubscribe":
+        return {"needs_approval": False,
+                "slack_note": f"⛔ *{who}: {ctx['contact_name']}* asked to stop emails. Marked unsubscribed; nothing sent."}
+
+    # Brand shared a brief: save the campaign now, ask before starting Fred
+    live = None
+    if is_brand and msg.gmail_thread_id:
+        with engine.connect() as conn:
+            live = conn.execute(text("""
+                SELECT campaign_id, status FROM campaigns
+                WHERE gmail_thread_id = :t AND status NOT IN ('brief_received', 'completed', 'cancelled', 'lost')
+                ORDER BY id DESC LIMIT 1
+            """), {"t": msg.gmail_thread_id}).mappings().first()
+    if live and parsed.get("has_campaign_details"):
+        notes.append(f"ℹ️ Campaign `{live['campaign_id']}` is already `{live['status']}`, so the brief wasn't changed. "
+                     f"Update it yourself if they changed budget or timeline.")
+    elif is_brand and parsed.get("has_campaign_details"):
+        brief = {k: v for k, v in (parsed.get("campaign_brief") or {}).items()
+                 if k in CampaignFromBriefRequest.model_fields}
+        camp = await upsert_campaign_from_brief(CampaignFromBriefRequest(
+            **brief, brand_id=ctx["contact_id"], gmail_thread_id=msg.gmail_thread_id))
+        campaign_id = camp["campaign"]["campaign_id"]
+        saved.append(f"brief saved to campaign `{campaign_id}`")
+        if camp.get("below_minimum"):
+            notes.append(f"⚠️ Budget {format_inr(camp.get('deal_value') or 0)} is under your minimum, so Fred "
+                         f"won't start. Approving only sends the reply.")
+        elif (camp.get("deal_value") or 0) > 0 and camp["campaign"].get("status") == "brief_received":
+            actions.append({"type": "start_fred", "campaign_id": campaign_id})
+
+    draft = await _draft_for(ctx, msg, history, s, summary=parsed.get("summary") or "", intent=intent,
+                             questions=parsed.get("questions"), extracted=parsed.get("extracted_data"))
+    return {"needs_approval": True, "summary": parsed.get("summary") or "", "flag": draft["flag"],
+            "reason": draft.get("reason"), "draft": draft["draft"], "actions": actions, "saved": saved,
+            "notes": notes, "campaign_id": campaign_id, "immediate": immediate,
+            "slack_note": f"{'🟢' if intent == 'interested' else '🟡' if intent == 'needs_info' else '🔴' if intent == 'not_interested' else '⚪'} "
+                          f"*{who}: {ctx['contact_name']}* · `{intent}` {parsed.get('summary') or ''}"}
+
+
+async def _plan_offer_reply(msg, ctx, history, s) -> dict:
+    o = ctx["offer"]
+    oid = o["offer_id"]
+    name, first, brand = o["creator_name"], _first_name(o["creator_name"]), o["brand_name"]
+    parsed = parse_json_object(await call_claude(OFFER_REPLY_PROMPT, f"""OFFER
+Payout offered: INR {o['offered_amount']}
+Deliverables: {o['deliverables'] or 'not specified'}
+Offer status: {o['status']}
+
+EARLIER EMAILS:
+{history or '(none)'}
+
+CREATOR'S REPLY:
+{strip_quoted_reply(msg.body or '')}
+
+Return ONLY the JSON object."""))
+    intent = str(parsed.get("intent", "question")).strip().lower()
+    if intent not in OFFER_INTENTS | {"interested"}:
+        intent = "question"
+    counter_amount = to_int_or_none(parsed.get("counter_amount"))
+    if intent == "counter" and not counter_amount:
+        intent = "question"
+    summary = parsed.get("summary") or ""
+    reason = clean_text(parsed.get("reason"))
+
+    with engine.begin() as conn:
+        _set_log(conn, msg, f"offer_{intent}", parsed)
+        saved = _save_creator_facts(conn, o["creator_id"], {
+            "rate_card": clean_text(parsed.get("rate_card")),
+            "restrictions": clean_text(parsed.get("restrictions")),
+            "availability": clean_text(parsed.get("availability"))})
+        if intent == "unsubscribe":
+            conn.execute(text("UPDATE creators SET unsubscribed = TRUE, status = 'unsubscribed' WHERE creator_id = :c"),
+                         {"c": o["creator_id"]})
+        accepted, target = _slot_status(conn, o["campaign_id"], o["pricing_model"], o["slots"])
+        others_open = conn.execute(text("""
+            SELECT COUNT(*) FROM offers WHERE campaign_id = :c AND offer_id <> :oid
+              AND status IN ('sent', 'countered')
+        """), {"c": o["campaign_id"], "oid": oid}).scalar() or 0
+    slot_open = (o.get("campaign_status") == "offers_sent") and (not target or accepted + others_open < target)
+    base = {"needs_approval": True, "summary": summary, "saved": saved, "notes": [], "actions": [],
+            "campaign_id": o["campaign_id"], "offer_id": oid, "immediate": {}}
+
+    if intent == "auto_reply":
+        return {"needs_approval": False}
+
+    active = o["status"] in ("sent", "countered")
+    if intent == "unsubscribe" and not active:
+        return {"needs_approval": False,
+                "slack_note": f"⛔ *{name}* asked to stop emails. Marked unsubscribed; nothing sent."}
+
+    # Counter: hand straight to the existing counter form (that form is the approval)
+    if intent == "counter" and active:
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE offers SET status = 'countered', counter_amount = :a, responded_at = NOW() "
+                              "WHERE offer_id = :oid"), {"a": counter_amount, "oid": oid})
+        rate = o["rate_per_collab"] if o["pricing_model"] == "per_collab" else None
+        m = (1 - counter_amount / rate) if rate else None
+        pct = f"{round(m * 100)}%" if m is not None else "unknown"
+        counter_text = (f"💬 *{name}* countered on the {brand} offer: asks *{format_inr(counter_amount)}* "
+                        f"(offered {format_inr(o['offered_amount'])}). Margin on this slot would be *{pct}*.\n"
+                        f"Use the form below to accept, decline, or offer a different amount.")
+        return {"needs_approval": False,
+                "immediate": {"start_counter_review": True, "offer_id": oid, "counter_text": counter_text},
+                "slack_note": f"💬 *{name}* countered on {brand}: {format_inr(counter_amount)} vs {format_inr(o['offered_amount'])}."}
+
+    if intent == "accept" and active:
+        deal_value = o["total_budget"] or ((o["rate_per_collab"] or 0) * (o["slots"] or 1))
+        script_step = deal_value >= float(s.get("small_deal_threshold_inr", 25000))
+        draft = build_acceptance_email(first, brand, o["deliverables"], o["deadline"], o["offered_amount"], script_step, s)
+        base["actions"].append({"type": "accept_offer", "offer_id": oid, "amount": o["offered_amount"],
+                                "label": f"Mark the offer accepted at {format_inr(o['offered_amount'])} "
+                                         f"(slot {accepted + 1} of {target or '?'})"})
+        return {**base, "flag": "✅ Accepted", "draft": draft,
+                "slack_note": f"✅ *{name}* said yes to the {brand} offer. Waiting for your approval."}
+
+    if intent in ("decline", "unsubscribe") and active:
+        base["actions"].append({"type": "decline_offer", "offer_id": oid, "reason": reason,
+                                "unsubscribe": intent == "unsubscribe"})
+        return {**base, "flag": "❌ Declined", "draft": build_decline_email(first, intent == "unsubscribe"),
+                "slack_note": f"❌ *{name}* declined the {brand} offer."}
+
+    # Positive reply to an offer that already closed: offer to reopen if a slot is still free
+    if intent in ("accept", "interested") and o["status"] in ("expired", "withdrawn"):
+        if slot_open:
+            base["actions"].append({"type": "reopen_offer", "offer_id": oid,
+                                    "label": f"Reopen the expired offer for {name} for another "
+                                             f"{int(s.get('offer_expiry_hours', 48))} hours"})
+            if intent == "accept":
+                base["actions"].append({"type": "accept_offer", "offer_id": oid, "amount": o["offered_amount"],
+                                        "label": f"Then mark it accepted at {format_inr(o['offered_amount'])}"})
+                deal_value = o["total_budget"] or ((o["rate_per_collab"] or 0) * (o["slots"] or 1))
+                script_step = deal_value >= float(s.get("small_deal_threshold_inr", 25000))
+                draft = build_acceptance_email(first, brand, o["deliverables"], o["deadline"], o["offered_amount"],
+                                               script_step, s, opening="Good news: your spot is still open. Welcome aboard! 🎉")
+                return {**base, "flag": "⚠️ Late reply", "reason": "The offer had expired, but a slot is still open",
+                        "draft": draft}
+            d = await _draft_for(ctx, msg, history, s, summary, intent, parsed.get("questions"),
+                                 context=_offer_context(o, s) + "\nThe offer had expired, but the spot is still "
+                                         "open and we will reopen it. Ask them to reply \"Accept\" to confirm.")
+            return {**base, "flag": "⚠️ Late reply", "reason": "The offer had expired, but a slot is still open",
+                    "draft": d["draft"]}
+        d = await _draft_for(ctx, msg, history, s, summary, intent, parsed.get("questions"),
+                             context=_offer_context(o, s) + "\nThis campaign is now full. Thank them warmly and "
+                                     "say we'll send them the next campaign that fits.")
+        base["notes"].append("ℹ️ This campaign is already full, so the offer stays closed.")
+        return {**base, "flag": "⚠️ Late reply", "reason": "The offer had expired and the campaign is full",
+                "draft": d["draft"]}
+
+    # Interested / question / anything else: Aditya drafts an answer with the offer in view
+    d = await _draft_for(ctx, msg, history, s, summary, intent, parsed.get("questions"),
+                         context=_offer_context(o, s))
+    flag = d["flag"]
+    if intent == "interested" and active:
+        flag = "🟢 Interested"
+    return {**base, "flag": flag, "reason": d.get("reason"), "draft": d["draft"],
+            "slack_note": f"💬 *{name}* replied about the {brand} offer: {summary}"}
+
+
+async def _plan_lineup_reply(msg, ctx, history, s) -> dict:
+    c = ctx["campaign"]
+    cid, brand = c["campaign_id"], c["brand_name"]
+    parsed = parse_json_object(await call_claude(
+        LINEUP_REPLY_PROMPT,
+        f"BRAND: {brand}\n\nEARLIER EMAILS:\n{history or '(none)'}\n\nTHEIR REPLY:\n"
+        f"{strip_quoted_reply(msg.body or '')}\n\nReturn ONLY the JSON object."))
+    intent = str(parsed.get("intent", "question")).strip().lower()
+    if intent not in LINEUP_INTENTS:
+        intent = "question"
+    summary = parsed.get("summary") or ""
+    reason = clean_text(parsed.get("reason"))
+    with engine.begin() as conn:
+        _set_log(conn, msg, f"lineup_{intent}", parsed)
+    base = {"needs_approval": True, "summary": summary, "saved": [], "notes": [], "actions": [],
+            "campaign_id": cid, "immediate": {}}
+
+    if intent == "auto_reply":
+        return {"needs_approval": False}
+    is_open = c["status"] == "shortlist_sent"
+
+    if intent == "confirm" and is_open:
+        base["actions"].append({"type": "confirm_lineup", "campaign_id": cid})
+        if PAYMENT_DETAILS:
+            draft = _payment_request_email(c, brand, s)
+            return {**base, "flag": "🎉 Confirmed", "draft": draft,
+                    "slack_note": f"🎉 *{brand}* confirmed the lineup. Waiting for your approval to request the advance."}
+        base["notes"].append("⚠️ PAYMENT_DETAILS isn't set on Railway, so the email below has no bank details. "
+                             "Edit them in before approving.")
+        d = await _draft_for(ctx, msg, history, s, summary, intent, parsed.get("questions"), context=_lineup_context(c, s))
+        return {**base, "flag": "⚠️ Needs your call", "draft": d["draft"]}
+
+    if intent == "reject_creators" and is_open:
+        saved_labels = c.get("lineup_labels") or {}
+        ids = _match_labels(parsed.get("rejected_labels"), saved_labels) or _match_labels(
+            re.findall(r"(?i)\bcreator\s+([a-z])\b", strip_quoted_reply(msg.body or "")), saved_labels)
+        if ids:
+            with engine.begin() as conn:
+                rows = conn.execute(text("""
+                    SELECT o.offer_id, cr.creator_name, cr.handle, cr.platform, cr.follower_count,
+                           cr.engagement_rate, cr.location, cr.niche, m.anon_summary
+                    FROM offers o JOIN creators cr ON cr.creator_id = o.creator_id
+                    LEFT JOIN matches m ON m.id = o.match_id
+                    WHERE o.offer_id = ANY(:ids)
+                """), {"ids": ids}).mappings().all()
+            label_of = {v: k for k, v in saved_labels.items()}
+            rejected = [{**dict(r), "label": label_of.get(r["offer_id"])} for r in rows]
+            draft = await draft_rejection_reply(brand, reason, rejected)
+            hold = int(s.get("creator_hold_hours", 48))
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    UPDATE offers SET brand_rejected_at = NOW(), release_after = NOW() + make_interval(hours => :h)
+                    WHERE offer_id = ANY(:ids)
+                """), {"h": hold, "ids": ids})
+            labels_txt = ", ".join(r["label"] for r in rejected if r["label"])
+            names = ", ".join(r["creator_name"] for r in rejected)
+            why = f"\nTheir reason: _{reason}_" if reason else "\nNo reason given."
+            return {"needs_approval": False, "immediate": {
+                "start_rejection_review": True, "campaign_id": cid, "rejection_draft": draft,
+                "rejection_prompt": (f"🔁 *{brand}* wants to remove {labels_txt} ({names}).{why}\nHeld for {hold} hours."
+                                     f"\n\n*Ananya's draft reply:*\n```{draft}```\n\nSend the draft, edit it, "
+                                     f"replace the creator, or proceed with fewer creators.")},
+                "slack_note": f"🔁 *{brand}* wants to remove {labels_txt}."}
+
+    if intent == "decline" and is_open:
+        why = f" Reason: _{reason}_" if reason else ""
+        return {"needs_approval": False, "immediate": {
+            "start_close_review": True, "campaign_id": cid, "close_reason": reason,
+            "close_prompt": (f"🛑 *{brand}* doesn't want to go ahead with the campaign.{why}\n"
+                             f"Close it and release the creators, or keep it open to follow up yourself?")},
+            "slack_note": f"🛑 *{brand}* declined the lineup."}
+
+    if intent == "payment_sent":
+        base["notes"].append("💸 Check your bank account. Once the advance is in, tap *Payment received* on the "
+                             "waiting payment message (that's what releases names to the brand and creators).")
+        draft = (f"Hi {brand} team,\n\nThank you! We'll confirm as soon as the transfer reflects in our account, "
+                 f"and then share each creator's name and profile with you right away.\n\n{ANANYA_SIGNOFF}")
+        return {**base, "flag": "💸 Says paid", "draft": draft,
+                "slack_note": f"💸 *{brand}* says the advance has been sent."}
+
+    d = await _draft_for(ctx, msg, history, s, summary, intent, parsed.get("questions"), context=_lineup_context(c, s))
+    return {**base, "flag": d["flag"], "reason": d.get("reason"), "draft": d["draft"],
+            "slack_note": f"❓ *{brand}* wrote about the lineup: {summary}"}
+
+
+def _payment_request_email(c: dict, brand: str, s: dict) -> str:
+    advance = c.get("advance_amount") or 0
+    registered = float(s.get("gst_registered", 0)) >= 1
+    gst_on_advance = int(round(advance * float(s.get("gst_rate", 0.18)))) if registered else 0
+    amount_line = (f"{format_inr(advance)} + GST ({format_inr(gst_on_advance)}) = {format_inr(advance + gst_on_advance)}"
+                   if registered else format_inr(advance))
+    balance = (c.get("final_brand_price") or 0) - advance
+    balance_line = format_inr(balance) + (" + GST" if registered else "")
+    pct = int(float(s.get("advance_pct", 0.7)) * 100)
+    return f"""Hi {brand} team,
+
+Thank you for confirming!
+
+To lock in the lineup, please transfer the {pct}% advance:
+Amount: {amount_line}
+
+{PAYMENT_DETAILS}
+
+Please reply to this email once the transfer is done. As soon as we receive it, we'll share each creator's name and profile with you and send them the full brief.
+
+The remaining {100 - pct}% ({balance_line}) is due before the content goes live.
+
+{ANANYA_SIGNOFF}"""
+
+
+class InboxApproval(BaseModel):
+    action_id: str
+    decision: str                       # the Slack choice: "Approve", "Edit email and approve", "I'll handle it"
+    edited_email: Optional[str] = None
+
+
+@app.post("/inbox/approve")
+async def inbox_approve(req: InboxApproval):
+    """Carry out an approved plan. Every step re-checks the current state first."""
+    try:
+        s = load_settings()
+        d = (req.decision or "").strip().lower()
+        out = {"status": "success", "action_id": req.action_id, "send_email": False, "email_text": None,
+               "reply_to_message_id": None, "inbox": None, "start_fred": False, "start_next_offers": False,
+               "all_slots_filled": False, "start_payment_wait": False, "payment_prompt": None,
+               "campaign_id": None, "slack_text": None}
+
+        with engine.begin() as conn:
+            p = conn.execute(text("SELECT * FROM pending_actions WHERE action_id = :a FOR UPDATE"),
+                             {"a": req.action_id}).mappings().first()
+            if not p:
+                raise HTTPException(status_code=404, detail="Action not found")
+            p = dict(p)
+            out.update({"reply_to_message_id": p["reply_to_message_id"], "inbox": p["inbox"],
+                        "campaign_id": p["campaign_id"]})
+            if p["status"] != "pending":
+                return {**out, "status": "skipped", "slack_text": f"ℹ️ Already {p['status']}, nothing done."}
+
+            if "myself" in d or "handle" in d:
+                conn.execute(text("UPDATE pending_actions SET status = 'handled_by_deven', decision = :d, "
+                                  "decided_at = NOW() WHERE action_id = :a"), {"d": req.decision, "a": req.action_id})
+                return {**out, "slack_text": f"👋 Left for you: {p['contact_name']}. Nothing was sent."}
+            # Only a clear Approve / Edit counts. A timed-out card (empty choice) never approves anything.
+            if not (d.startswith("approve") or d.startswith("edit")):
+                conn.execute(text("UPDATE pending_actions SET status = 'no_decision', decision = :d, "
+                                  "decided_at = NOW() WHERE action_id = :a"), {"d": req.decision, "a": req.action_id})
+                return {**out, "status": "skipped",
+                        "slack_text": f"⏰ No decision on {p['contact_name']}'s reply, so nothing was sent. Reply in Gmail if needed."}
+
+            done, problems, block_email = [], [], False
+            for a in (p["plan"] or []):
+                t = a.get("type")
+                if t == "start_fred":
+                    st = conn.execute(text("SELECT status FROM campaigns WHERE campaign_id = :c"),
+                                      {"c": a["campaign_id"]}).scalar()
+                    if st == "brief_received":
+                        out["start_fred"] = True
+                        out["campaign_id"] = a["campaign_id"]
+                        done.append("Fred started")
+                    else:
+                        problems.append(f"Fred not started (campaign is `{st}`)")
+
+                elif t == "reopen_offer":
+                    hours = int(s.get("offer_expiry_hours", 48))
+                    n = conn.execute(text("""
+                        UPDATE offers SET status = 'sent', expires_at = NOW() + make_interval(hours => :h)
+                        WHERE offer_id = :oid AND status IN ('expired', 'withdrawn')
+                          AND campaign_id IN (SELECT campaign_id FROM campaigns WHERE status = 'offers_sent')
+                    """), {"h": hours, "oid": a["offer_id"]}).rowcount
+                    (done if n else problems).append("offer reopened" if n else "offer could not be reopened")
+                    if not n:
+                        block_email = True
+
+                elif t == "accept_offer":
+                    o = conn.execute(text("""
+                        SELECT o.status, o.campaign_id, c.pricing_model, c.slots FROM offers o
+                        JOIN campaigns c ON c.campaign_id = o.campaign_id WHERE o.offer_id = :oid
+                    """), {"oid": a["offer_id"]}).mappings().first()
+                    free = True
+                    if o and o["status"] in ("sent", "countered"):
+                        acc0, tgt0 = _slot_status(conn, o["campaign_id"], o["pricing_model"], o["slots"])
+                        free = not tgt0 or acc0 < tgt0
+                    if o and o["status"] in ("sent", "countered") and free:
+                        conn.execute(text("""
+                            UPDATE offers SET status = 'accepted', final_amount = :f, responded_at = NOW()
+                            WHERE offer_id = :oid
+                        """), {"f": a["amount"], "oid": a["offer_id"]})
+                        accepted, target = _slot_status(conn, o["campaign_id"], o["pricing_model"], o["slots"])
+                        done.append(f"offer accepted ({accepted}/{target} slots filled)")
+                        out["campaign_id"] = o["campaign_id"]
+                        if target and accepted >= target:
+                            out["all_slots_filled"] = True
+                            done.append("all slots filled: preparing the lineup")
+                    elif o and not free:
+                        problems.append("offer not accepted: all slots are already filled")
+                        block_email = True
+                    else:
+                        problems.append(f"offer not accepted (it is `{o['status'] if o else 'missing'}`)")
+                        block_email = True
+
+                elif t == "decline_offer":
+                    n = conn.execute(text("""
+                        UPDATE offers SET status = 'declined', decline_reason = :r, responded_at = NOW()
+                        WHERE offer_id = :oid AND status IN ('sent', 'countered')
+                    """), {"r": a.get("reason") or ("unsubscribed" if a.get("unsubscribe") else None),
+                           "oid": a["offer_id"]}).rowcount
+                    if n:
+                        out["start_next_offers"] = True
+                        done.append("offer closed, next creator will get an offer")
+                    else:
+                        problems.append("offer was already closed")
+                        block_email = True
+
+                elif t == "confirm_lineup":
+                    n = conn.execute(text("UPDATE campaigns SET status = 'confirmed' WHERE campaign_id = :c "
+                                          "AND status = 'shortlist_sent'"), {"c": a["campaign_id"]}).rowcount
+                    if n:
+                        conn.execute(text("UPDATE offers SET brand_rejected_at = NULL, release_after = NULL "
+                                          "WHERE campaign_id = :c AND status = 'accepted'"), {"c": a["campaign_id"]})
+                        c = conn.execute(text("SELECT c.*, b.brand_name FROM campaigns c JOIN brands b "
+                                              "ON b.brand_id = c.brand_id WHERE c.campaign_id = :c"),
+                                         {"c": a["campaign_id"]}).mappings().first()
+                        pct = int(float(s.get("advance_pct", 0.7)) * 100)
+                        out["start_payment_wait"] = True
+                        out["payment_prompt"] = (f"💰 *{c['brand_name']} confirmed the lineup!* Waiting for the {pct}% "
+                                                 f"advance of *{format_inr(c['advance_amount'] or 0)}*.\n"
+                                                 f"Tap the button once it's in your account.")
+                        done.append("lineup confirmed, waiting for the advance")
+                    else:
+                        problems.append("lineup was not open any more")
+                        block_email = True
+
+            email = (req.edited_email or "").strip() if ("edit" in d and (req.edited_email or "").strip()) else (p["draft"] or "")
+            email = email.strip()          # templates and your edits go out exactly as shown on the card
+            if block_email:
+                problems.append("so the email was NOT sent. Reply in Gmail yourself if needed")
+                email = ""
+            out["send_email"] = bool(email)
+            out["email_text"] = email or None
+            conn.execute(text("""
+                UPDATE pending_actions SET status = 'approved', decision = :d, final_email = :e, decided_at = NOW()
+                WHERE action_id = :a
+            """), {"d": req.decision, "e": email, "a": req.action_id})
+
+        bits = (["email sent"] if email else []) + done
+        out["slack_text"] = (f"✅ {p['contact_name']}: " + (", ".join(bits) if bits else "nothing to do")
+                             + (("\n⚠️ " + "; ".join(problems)) if problems else ""))
+        return out
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error applying approval: {str(e)}")
 
 
 if __name__ == "__main__":
