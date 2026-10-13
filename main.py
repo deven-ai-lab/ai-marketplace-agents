@@ -751,6 +751,14 @@ def to_days(value):
     return None
 
 
+def to_date_or_none(value):
+    """'2026-10-19' -> date, anything else -> None"""
+    try:
+        return datetime.strptime(str(value).strip()[:10], "%Y-%m-%d").date() if value else None
+    except (ValueError, TypeError):
+        return None
+
+
 def to_int_or_none(value):
     try:
         return int(float(value)) if value not in (None, "") else None
@@ -794,7 +802,9 @@ Put the number of creators wanted in slots, for EITHER pricing model ("3 creator
 TIMELINE:
 - timeline_days is the number of days until the content should be live, as an integer.
 - Convert: "2 weeks" = 14, "10 days" = 10, "1 month" = 30, "next week" = 7.
-- If they give a specific date instead, put null here and mention the date in "notes".
+- If they give a specific date ("by 15th Oct", "before Diwali on 1 Nov"), put it in deadline_date as
+  YYYY-MM-DD (use TODAY's date to pick the year; never a date in the past) and set timeline_days to null.
+- If they move an earlier date, use the NEW date.
 
 Format:
 {
@@ -812,6 +822,7 @@ Format:
   "location_requirement": "cities or regions creators must be in, or null",
   "deliverables": "e.g. 1 Reel + 2 Stories per creator, or null",
   "timeline_days": 21,
+  "deadline_date": "2026-11-01 or null",
   "requirements": "any other requirements, or null",
   "notes": "anything else important, or null"
 }
@@ -848,7 +859,8 @@ Format:
 
 def build_reply_message(request: ParseReplyRequest, contact_label: str) -> str:
     original = f"\nOUR ORIGINAL PITCH (for context):\n{request.original_pitch}\n" if request.original_pitch else ""
-    return f"""{contact_label}: {request.contact_name or request.contact_id}
+    return f"""TODAY: {datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime('%Y-%m-%d (%A)')}
+{contact_label}: {request.contact_name or request.contact_id}
 From: {request.from_email or 'unknown'}
 Subject: {request.reply_subject or ''}
 {original}
@@ -899,11 +911,13 @@ async def steve_parse_reply(request: ParseReplyRequest):
             "location_requirement": clean_text(parsed.get("location_requirement")),
             "deliverables": clean_text(parsed.get("deliverables")),
             "timeline_days": to_days(parsed.get("timeline_days")),
+            "deadline": (str(to_date_or_none(parsed.get("deadline_date")))
+                         if to_date_or_none(parsed.get("deadline_date")) else None),
             "requirements": clean_text(parsed.get("requirements")),
         }
 
         # A campaign is created only when the brand shares real brief details
-        detail_keys = ["total_budget", "rate_per_collab", "platform", "niche", "deliverables", "timeline_days"]
+        detail_keys = ["total_budget", "rate_per_collab", "platform", "niche", "deliverables", "timeline_days", "deadline"]
         has_campaign_details = (
             intent not in ("not_interested", "auto_reply", "unsubscribe")
             and any(campaign_brief[k] is not None for k in detail_keys)
@@ -1298,6 +1312,7 @@ class CampaignFromBriefRequest(BaseModel):
     deliverables: Optional[str] = None
     requirements: Optional[str] = None
     timeline_days: Optional[int] = None
+    deadline: Optional[str] = None          # a specific go-live date, YYYY-MM-DD
 
 
 def load_settings() -> dict:
@@ -1316,6 +1331,12 @@ async def upsert_campaign_from_brief(req: CampaignFromBriefRequest):
     try:
         s = load_settings()
         brief = {f: getattr(req, f) for f in BRIEF_FIELDS}
+        go_live = to_date_or_none(req.deadline)
+        if go_live:
+            brief["deadline"] = go_live
+            if not brief.get("timeline_days"):
+                today = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
+                brief["timeline_days"] = max((go_live - today).days, 1)
 
         # Infer pricing model only when budget info exists
         if brief["pricing_model"] not in ("campaign_pool", "per_collab"):
@@ -1352,7 +1373,7 @@ async def upsert_campaign_from_brief(req: CampaignFromBriefRequest):
                     ORDER BY id DESC LIMIT 1
                 """), {"thread": req.gmail_thread_id}).first()
 
-            update_fields = BRIEF_FIELDS + ["exclusivity_days", "revisions_allowed"]
+            update_fields = BRIEF_FIELDS + ["exclusivity_days", "revisions_allowed"] + (["deadline"] if go_live else [])
 
             if existing:
                 campaign_id = existing[0]
@@ -4537,6 +4558,50 @@ async def _draft_for(ctx, msg, history, s, summary="", intent="", questions=None
     return await draft_question_reply(ctx["contact_type"], req)
 
 
+FRED_RERUN_STATUSES = {"brief_received", "matching", "awaiting_approval"}
+FRED_FIELDS = {"total_budget", "rate_per_collab", "slots", "platform", "niche", "target_audience",
+               "location_requirement", "deliverables", "deadline", "timeline_days"}
+CHANGE_NAMES = {"total_budget": "budget", "rate_per_collab": "rate per creator", "slots": "creators",
+                "location_requirement": "location", "target_audience": "audience", "deadline": "go-live date",
+                "timeline_days": "timeline (days)"}
+
+
+def _brief_changes(campaign_id: str, brief: dict) -> dict:
+    """Fields in the new brief that differ from the saved campaign: {field: [old, new]}"""
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT * FROM campaigns WHERE campaign_id = :c"), {"c": campaign_id}).mappings().first()
+    if not row:
+        return {}
+    out = {}
+    for k, new in brief.items():
+        if new in (None, "", []) or k not in row.keys() or k in ("pricing_model", "budget_text"):
+            continue
+        old = row[k]
+        if k == "deadline":
+            old = str(old) if old else None
+            new = str(new)
+        if str(old) != str(new):
+            out[k] = [old, new]
+    # A new date replaces any old day count
+    if "deadline" in out:
+        out.pop("timeline_days", None)
+    return out
+
+
+def _change_text(k, v) -> str:
+    old, new = v
+    def f(x):
+        if x in (None, ""):
+            return "not set"
+        if k in ("total_budget", "rate_per_collab") and str(x).isdigit():
+            return format_inr(int(x))
+        if k == "deadline":
+            d = to_date_or_none(x)
+            return d.strftime("%d %b") if d else str(x)
+        return str(x)
+    return f"{CHANGE_NAMES.get(k, k)} {f(old)} → {f(new)}"
+
+
 async def _plan_pitch_reply(msg, ctx, history, s) -> dict:
     is_brand = ctx["contact_type"] == "brand"
     preq = ParseReplyRequest(contact_id=ctx["contact_id"], contact_name=ctx["contact_name"],
@@ -4582,8 +4647,17 @@ async def _plan_pitch_reply(msg, ctx, history, s) -> dict:
                 ORDER BY id DESC LIMIT 1
             """), {"t": msg.gmail_thread_id}).mappings().first()
     if live and parsed.get("has_campaign_details"):
-        notes.append(f"ℹ️ Campaign `{live['campaign_id']}` is already `{live['status']}`, so the brief wasn't changed. "
-                     f"Update it yourself if they changed budget or timeline.")
+        campaign_id = live["campaign_id"]
+        changes = _brief_changes(campaign_id, parsed.get("campaign_brief") or {})
+        if changes:
+            actions.append({"type": "update_campaign", "campaign_id": campaign_id, "changes": changes,
+                            "label": "Update the campaign: " + "; ".join(_change_text(k, v) for k, v in changes.items())})
+            if live["status"] in FRED_RERUN_STATUSES and set(changes) & FRED_FIELDS:
+                actions.append({"type": "start_fred", "campaign_id": campaign_id,
+                                "label": "Rerun Fred with the new details (approved creators are kept)"})
+            elif live["status"] not in FRED_RERUN_STATUSES:
+                notes.append(f"⚠️ Offers for this campaign are already out (`{live['status']}`). Updating the campaign "
+                             f"won't change offers creators already have; tell them about the change in their thread.")
     elif is_brand and parsed.get("has_campaign_details"):
         brief = {k: v for k, v in (parsed.get("campaign_brief") or {}).items()
                  if k in CampaignFromBriefRequest.model_fields}
@@ -4880,12 +4954,28 @@ async def inbox_approve(req: InboxApproval):
                 if t == "start_fred":
                     st = conn.execute(text("SELECT status FROM campaigns WHERE campaign_id = :c"),
                                       {"c": a["campaign_id"]}).scalar()
-                    if st == "brief_received":
+                    if st in FRED_RERUN_STATUSES:
+                        if st == "awaiting_approval":
+                            conn.execute(text("UPDATE campaigns SET status = 'matching' WHERE campaign_id = :c"),
+                                         {"c": a["campaign_id"]})
                         out["start_fred"] = True
                         out["campaign_id"] = a["campaign_id"]
                         done.append("Fred started")
                     else:
                         problems.append(f"Fred not started (campaign is `{st}`)")
+
+                elif t == "update_campaign":
+                    upd = {}
+                    for k, (old, new) in (a.get("changes") or {}).items():
+                        upd[k] = to_date_or_none(new) if k == "deadline" else new
+                    if "deadline" in upd and upd["deadline"]:
+                        today = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
+                        upd["timeline_days"] = max((upd["deadline"] - today).days, 1)
+                    if upd:
+                        set_clause = ", ".join(f"{k} = :{k}" for k in upd)
+                        conn.execute(text(f"UPDATE campaigns SET {set_clause} WHERE campaign_id = :cid"),
+                                     {**upd, "cid": a["campaign_id"]})
+                        done.append("campaign updated")
 
                 elif t == "reopen_offer":
                     hours = int(s.get("offer_expiry_hours", 48))
