@@ -2525,12 +2525,16 @@ OFFER_REPLY_PROMPT = ADITYA_CORE + """
 A creator replied to a paid collaboration offer. Classify the reply.
 
 INTENT (pick exactly one):
-- "accept": clearly agrees, with NO conditions and NO questions.
-  e.g. "Yes, I accept", "I accept your offer", "Deal", "Sounds good, count me in"
+- "accept": clearly says yes to this offer as it stands.
+  e.g. "Yes, I accept", "I accept your offer", "Deal", "Sounds good, count me in".
+  It is STILL "accept" if they also ask simple questions that don't change the deal
+  ("I accept, what are the next steps?", "Accept! When will I get the brief?"). Put those in "questions".
+  It is NOT "accept" if they only agree on condition of a change (different payout, dates, deliverables,
+  or an advance payment): use "counter" for payout changes, "question" for other conditions.
 - "decline": says no, not interested, or not available
 - "counter": asks for a different payout, or accepts only if the payout changes
-- "question": asks something, or adds conditions (dates, deliverables, advance, brand name)
-  without clearly accepting or declining
+- "question": asks something WITHOUT clearly accepting, or adds conditions (dates, deliverables,
+  advance, brand name) before they will accept
 - "interested": positive ("I'm interested", "sounds good", "would love to") but has NOT clearly said
   yes to this exact offer, and asks nothing else
 - "auto_reply": out-of-office or automated message
@@ -4763,7 +4767,11 @@ Return ONLY the JSON object."""))
         base["actions"].append({"type": "accept_offer", "offer_id": oid, "amount": o["offered_amount"],
                                 "label": f"Mark the offer accepted at {format_inr(o['offered_amount'])} "
                                          f"(slot {accepted + 1} of {target or '?'})"})
-        return {**base, "flag": "✅ Accepted", "draft": draft,
+        qs = [str(q) for q in (parsed.get("questions") or []) if str(q).strip()]
+        if qs:
+            base["notes"].append("❓ They also asked: " + "; ".join(qs) + ". The confirmation below already explains "
+                                 "next steps, payout and timing. Use *Edit* if anything else needs an answer.")
+        return {**base, "flag": "✅ Accepted" + (" + question" if qs else ""), "draft": draft,
                 "slack_note": f"✅ *{name}* said yes to the {brand} offer. Waiting for your approval."}
 
     if intent in ("decline", "unsubscribe") and active:
