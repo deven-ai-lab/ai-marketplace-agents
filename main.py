@@ -2227,7 +2227,7 @@ def build_offer_terms(amount, deliverables, platform, deadline, revisions, exclu
         category = (industry or "competing").strip()
         lines.append(f"• Exclusivity: no posts for competing {category} brands for {exclusivity_days} days after publishing")
     lines.append(f"• Cancellation: if the brand cancels for its own reasons after you've created content that meets the brief, you receive {kill_fee}% of the payout in total. If the content doesn't meet the brief after the agreed revisions, no payment is due")
-    months = int(s.get("non_circumvention_months", 12))
+    months = int(s.get("creator_non_circumvention_months", 4))
     lines.append(f"• Working through Prabhaav: if you accept, you agree not to work directly with this brand, "
                  f"outside Prabhaav, for {months} months")
     lines.append(f"• This offer is open until {expires_at.astimezone(IST).strftime('%d %b, %I:%M %p')} IST")
@@ -2566,7 +2566,7 @@ def build_acceptance_email(first_name, brand_name, deliverable, deadline, amount
 
 The brand is {brand_name}. You're now on the final creator lineup we're presenting to them, and we'll confirm with you shortly.
 
-As agreed in the offer, please keep all work with {brand_name} through Prabhaav for the next {int(s.get("non_circumvention_months", 12))} months, rather than directly with the brand.
+As agreed in the offer, please keep all work with {brand_name} through Prabhaav for the next {int(s.get("creator_non_circumvention_months", 4))} months, rather than directly with the brand.
 
 Here's a recap of what you accepted:
 • Deliverables: {deliverable or 'to be confirmed with the brief'}
