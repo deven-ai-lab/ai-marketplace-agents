@@ -146,6 +146,7 @@ class PitchBrandInput(SheetRow):
     phone: Optional[str] = None
     website: Optional[str] = None
     basic_info: Optional[str] = None
+    source: Optional[str] = None            # "website" = they contacted us first
 
     @field_validator("phone", mode="before")
     @classmethod
@@ -178,6 +179,7 @@ class PitchCreatorInput(SheetRow):
     follower_count: Optional[int] = None
     engagement_rate: Optional[float] = None
     comments: Optional[str] = None
+    source: Optional[str] = None            # "website" = they contacted us first
 
     @field_validator("phone", mode="before")
     @classmethod
@@ -526,6 +528,23 @@ OPT_OUT_CREATOR = "If this isn't for you, just reply 'no thanks' and I won't mes
 
 
 # ============ STEVE: BRAND MANAGER AGENT (Ananya) ============
+def is_website_lead(source) -> bool:
+    return "web" in str(source or "").lower()
+
+
+WEBSITE_LEAD_RULES = """
+WEBSITE LEADS: if an entry says "Source: WEBSITE LEAD", they contacted us first through the form on
+prabhaav.co. Write a warm reply, not a cold pitch, and these rules replace the steps above for them:
+- Subject: warm and specific, e.g. "Thanks for reaching out to Prabhaav" plus their name or niche.
+- Open by thanking them for getting in touch through our website (one short line, no gushing).
+- Respond to what they wrote or want, if the notes say. Keep "what Prabhaav does" to one line at most.
+- Then ask for the same details as above, in one easy line.
+- 80-140 words. Leave out the opt-out line: they asked to hear from us.
+- The Basic Info and Notes are your team's private research. Use them to make the email specific,
+  but never copy them word for word, never mention internal remarks, and never say you researched them.
+"""
+
+
 STEVE_SYSTEM_PROMPT = ANANYA_CORE + """
 TASK: Write a first cold pitch email for each brand provided.
 
@@ -547,6 +566,7 @@ Each email:
 - After the call to action, add this line on its own: """ + OPT_OUT_BRAND + """
 - """ + SIGNOFF_RULE + ANANYA_SIGNOFF + """
 
+""" + WEBSITE_LEAD_RULES + """
 CRITICAL REQUIREMENT: Return exactly as many pitch emails as brands provided. Do NOT skip anyone.
 
 IMPORTANT: Return ONLY a valid JSON array. No preamble, no explanation.
@@ -569,7 +589,7 @@ def format_brand(i: int, brand: PitchBrandInput) -> str:
 - Industry: {brand.industry}
 - Email: {brand.email}
 - Website: {brand.website}
-- Basic Info: {brand.basic_info}"""
+- Basic Info: {brand.basic_info}""" + ("\n- Source: WEBSITE LEAD" if is_website_lead(brand.source) else "")
 
 
 @app.post("/agent/steve/generate-pitches-batch")
@@ -631,13 +651,14 @@ Each email:
      to take. Never invent brand names, campaigns or amounts.
   4. Make clear that joining is completely free: we never charge creators anything, and they receive
      their full payout because the brand pays us.
-  5. Ask for their details in one easy line: their minimum budget or usual rate per collaboration,
+  5. Ask for their details in one easy line: their rates for one Reel, one Story and one static post,
      any brands or categories they won't promote, their availability, and their best content format.
   6. Close with a clear, friendly call to action (a quick reply with those details).
 - Do not state any payout amounts or terms.
 - After the call to action, add this line on its own: """ + OPT_OUT_CREATOR + """
 - """ + SIGNOFF_RULE + ADITYA_SIGNOFF + """
 
+""" + WEBSITE_LEAD_RULES + """
 CRITICAL REQUIREMENT: Return exactly as many pitch emails as creators provided. Do NOT skip anyone.
 
 IMPORTANT: Return ONLY a valid JSON array. No preamble, no explanation.
@@ -663,7 +684,7 @@ def format_creator(i: int, creator: PitchCreatorInput) -> str:
 - Followers: {creator.follower_count}
 - Engagement Rate: {creator.engagement_rate}%
 - Basic Info: {creator.basic_info}
-- Notes: {creator.comments}"""
+- Notes: {creator.comments}""" + ("\n- Source: WEBSITE LEAD" if is_website_lead(creator.source) else "")
 
 
 @app.post("/agent/aditya/generate-pitches-batch")
@@ -849,6 +870,9 @@ For min_budget, use their rate for ONE main deliverable on their main platform (
 one YouTube video), not the cheapest add-on such as a single Story. If they give a range, use the lower end.
 If they give only one rate, use that. Copy their full rate card, word for word, into budget_text, and
 summarise it in notes (e.g. "Rate card: Story 1500, Reel 15000, Reel + 3 Stories 15000-18000").
+Also fill the price of ONE item of each format they priced, as integers in INR ("12k" = 12000), else null:
+reel_rate (one Reel, Short or short video), story_rate (one Story), post_rate (one static post or carousel).
+Never guess a format they didn't price; never split a bundle price into parts.
 For niche, use the reply, or our original pitch if it clearly states their niche.
 For location, audience_type and languages, only use what the reply says.
 
@@ -858,6 +882,9 @@ Format:
   "summary": "One sentence summary of the reply for the founder",
   "questions": ["Any questions the creator asked"],
   "min_budget": 25000,
+  "reel_rate": 25000,
+  "story_rate": null,
+  "post_rate": null,
   "budget_text": "exact budget wording from the email, or null",
   "restrictions": "categories or brands they will not promote, or null",
   "availability": "when they are available, or null",
@@ -977,6 +1004,9 @@ async def aditya_parse_reply(request: ParseReplyRequest):
             "summary": parsed.get("summary"),
             "questions": parsed.get("questions") or [],
             "min_budget": to_int_or_none(parsed.get("min_budget")),
+            "reel_rate": to_int_or_none(parsed.get("reel_rate")),
+            "story_rate": to_int_or_none(parsed.get("story_rate")),
+            "post_rate": to_int_or_none(parsed.get("post_rate")),
             "budget_text": clean_text(parsed.get("budget_text")),
             "restrictions": clean_text(parsed.get("restrictions")),
             "availability": clean_text(parsed.get("availability")),
@@ -1465,7 +1495,8 @@ Also return:
 - restriction_conflict: true if the creator's stated restrictions rule out this brand or product
 - availability_conflict: true if their stated availability clearly misses the campaign timeline
 - red_flags: suspicious numbers (very few followers, engagement implausible for the size), or null
-- estimated_rate: ONLY when their rate is unknown, a fair INR fee for this work in the Indian market
+- estimated_rate: ONLY when their price for this campaign is unknown, a fair INR fee for ALL the
+  campaign's deliverables (e.g. 1 Reel + 3 Stories) in the Indian market
   given their tier, niche and platform. Otherwise null. Be conservative, and when you estimate,
   say "rate estimated, confirm with creator" in concerns.
 - anon_summary: one positive sentence on why they fit, written for the brand. Describe strengths only.
@@ -1492,6 +1523,47 @@ Return ONLY a JSON array with one object per creator, no other text:
 
 def _words(value) -> set:
     return {w for w in re.findall(r"[a-z]+", str(value or "").lower()) if len(w) > 2}
+
+
+_NUM_WORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+_DELIVERABLE_RE = re.compile(
+    r"(\d+|a|an|one|two|three|four|five|six)?\s*(?:x\s*)?(?:instagram\s+|ig\s+|youtube\s+)?"
+    r"(reels?|shorts?|videos?|stor(?:y|ies)|posts?|carousels?|statics?)\b", re.I)
+
+
+def parse_deliverables(text_: Optional[str]) -> dict:
+    """'1 Reel + 3 Stories' -> {'reel': 1, 'story': 3, 'post': 0}. Unknown brief -> one Reel."""
+    counts = {"reel": 0, "story": 0, "post": 0}
+    for num, kind in _DELIVERABLE_RE.findall(text_ or ""):
+        n = int(num) if num.isdigit() else _NUM_WORDS.get(num.lower(), 1)
+        k = kind.lower()
+        fmt = "story" if k.startswith("stor") else "post" if k.startswith(("post", "carousel", "static")) else "reel"
+        counts[fmt] += max(n, 1)
+    if not any(counts.values()):
+        counts["reel"] = 1
+    return counts
+
+
+def package_cost(c: dict, deliverables: Optional[str], s: dict):
+    """Price of the campaign's deliverables for this creator, from their per-format rates.
+    Returns (cost or None, fully_from_their_rates, note)."""
+    counts = parse_deliverables(deliverables)
+    reel = c.get("reel_rate") or c.get("min_budget")
+    rates = {"reel": reel, "story": c.get("story_rate"), "post": c.get("post_rate")}
+    ratios = {"story": float(s.get("story_rate_ratio", 0.15)), "post": float(s.get("post_rate_ratio", 0.6))}
+    total, guessed = 0, []
+    for fmt, n in counts.items():
+        if not n:
+            continue
+        r = rates[fmt]
+        if r is None:
+            if fmt == "reel" or not reel:
+                return None, False, ""
+            r = int(round(reel * ratios[fmt] / 100.0) * 100)
+            guessed.append(f"{fmt} ≈ {format_inr(r)} ({int(ratios[fmt] * 100)}% of their Reel rate)")
+        total += n * int(r)
+    note = ("⚠️ Rate estimated: " + ", ".join(guessed) + ". Confirm with the creator") if guessed else ""
+    return total, not guessed, note
 
 
 def _platform_ok(creator_platform, campaign_platform) -> bool:
@@ -1568,6 +1640,7 @@ async def fred_match(request: FredMatchRequest):
                 SELECT creator_id, creator_name, platform, handle, basic_info, follower_count,
                        engagement_rate, comments, min_budget, restrictions, availability,
                        best_format, niche, location, audience_type, languages, rate_card,
+                       reel_rate, story_rate, post_rate,
                        gender, COALESCE(response_received, FALSE) AS replied
                 FROM creators
                 WHERE COALESCE(unsubscribed, FALSE) = FALSE
@@ -1621,7 +1694,8 @@ async def fred_match(request: FredMatchRequest):
         want_gender = str(campaign.get("creator_gender") or "").strip().lower()
         survivors = []
         for c in creators:
-            confirmed = c["min_budget"] is not None
+            c["_cost"], c["_cost_exact"], c["_cost_note"] = package_cost(c, campaign["deliverables"], s)
+            confirmed = c["_cost"] is not None
             c_gender = str(c.get("gender") or "").strip().lower()
             if c["creator_id"] in blocked:
                 excluded["exclusivity"] += 1
@@ -1631,7 +1705,7 @@ async def fred_match(request: FredMatchRequest):
                 excluded["platform"] += 1
             elif not _location_ok(c["location"], campaign["location_requirement"]):
                 excluded["location"] += 1
-            elif confirmed and c["min_budget"] > cap_stretch:
+            elif confirmed and c["_cost"] > cap_stretch:
                 excluded["over_budget"] += 1
             elif not confirmed and not include_unconfirmed:
                 excluded["rate_unknown"] += 1
@@ -1643,7 +1717,7 @@ async def fred_match(request: FredMatchRequest):
 
         def prescore(c):
             overlap = len(target_words & (_words(c["niche"]) | _words(c["basic_info"]) | _words(c["comments"])))
-            return overlap * 3 + (2 if c["min_budget"] is not None else 0) + min(float(c["engagement_rate"] or 0), 10) / 2
+            return overlap * 3 + (2 if c["_cost"] is not None else 0) + min(float(c["engagement_rate"] or 0), 10) / 2
 
         candidates = sorted(survivors, key=prescore, reverse=True)[:max_candidates]
 
@@ -1699,7 +1773,8 @@ Other requirements: {val(campaign['requirements'])}"""
 - Location: {val(c['location'])}
 - Audience: {val(c['audience_type'])}
 - Languages: {val(c['languages'])}
-- Rate: {('INR ' + str(c['min_budget']) + ' for one main post (e.g. a Reel)') if c['min_budget'] is not None else 'unknown'}
+- Rates: Reel {val(c.get('reel_rate') or c['min_budget'])}, Story {val(c.get('story_rate'))}, Post {val(c.get('post_rate'))}
+- Price for this campaign's deliverables: {('INR ' + str(c['_cost']) + ('' if c['_cost_exact'] else ' (partly estimated)')) if c['_cost'] is not None else 'unknown'}
 - Rate card: {val(c.get('rate_card'))}
 - Restrictions: {val(c['restrictions'])}
 - Availability: {val(c['availability'])}
@@ -1728,20 +1803,23 @@ Score ALL {len(candidates)} candidates. Return ONLY the JSON array."""
                 conflicts.append({"creator_id": c["creator_id"], "reason": sc.get("reasoning")})
                 continue
 
-            confirmed = c["min_budget"] is not None
+            known = c["_cost"] is not None
+            confirmed = known and c["_cost_exact"]
             estimated = to_int_or_none(sc.get("estimated_rate"))
-            cost = c["min_budget"] if confirmed else estimated
+            cost = c["_cost"] if known else estimated
             concerns = sc.get("concerns")
             flags = []
             if not c.get("replied"):
                 flags.append("⚠️ Never replied to our first email, rate is a guess")
+            if c["_cost_note"]:
+                flags.append(c["_cost_note"])
             if want_gender and not str(c.get("gender") or "").strip():
                 flags.append(f"⚠️ Gender not recorded (brand asked for {want_gender} creators)")
             if flags:
                 concerns = " · ".join(flags) + (f". {concerns}" if concerns else "")
 
             # An estimate above the stretch budget rules the creator out, like a confirmed high price
-            if not confirmed and estimated is not None and estimated > cap_stretch:
+            if not known and estimated is not None and estimated > cap_stretch:
                 estimated_over_budget.append({"creator_id": c["creator_id"], "estimated_rate": estimated})
                 continue
 
@@ -1764,7 +1842,7 @@ Score ALL {len(candidates)} candidates. Return ONLY the JSON array."""
                 "red_flags": sc.get("red_flags"),
                 "anon_summary": sc.get("anon_summary"),
                 "rate_confirmed": confirmed,
-                "estimated_rate": None if confirmed else estimated,
+                "estimated_rate": None if confirmed else cost,
                 "is_stretch": is_stretch,
                 "suggested_payout": int(payout),
             })
@@ -2566,12 +2644,15 @@ counter_amount: the payout they ask for, as an integer in INR ("12k" = 12000, "1
 Never guess an amount.
 
 Also pull out profile facts if they share them (else null): rate_card (their prices, word for word),
-restrictions (categories they won't promote), availability. Never copy bank, UPI, PAN or Aadhaar details.
+restrictions (categories they won't promote), availability, and the price of ONE item per format they
+priced as integers in INR: reel_rate, story_rate, post_rate (never split a bundle price).
+Never copy bank, UPI, PAN or Aadhaar details.
 
 Return ONLY a JSON object, no other text:
 {"intent": "accept", "counter_amount": null, "reason": "short reason if they declined, else null",
  "questions": ["any questions they asked"], "summary": "one sentence for the founder",
- "rate_card": null, "restrictions": null, "availability": null}
+ "rate_card": null, "reel_rate": null, "story_rate": null, "post_rate": null,
+ "restrictions": null, "availability": null}
 """
 
 OFFER_INTENTS = {"accept", "decline", "counter", "question", "auto_reply", "unsubscribe"}
@@ -4316,8 +4397,11 @@ def _ensure_inbox_tables():
             for col in ("founder_draft", "founder_reason", "contact_email", "subject"):
                 conn.execute(text(f"ALTER TABLE pending_actions ADD COLUMN IF NOT EXISTS {col} TEXT"))
             conn.execute(text("ALTER TABLE creators ADD COLUMN IF NOT EXISTS gender TEXT"))
+            for col in ("reel_rate", "story_rate", "post_rate"):
+                conn.execute(text(f"ALTER TABLE creators ADD COLUMN IF NOT EXISTS {col} INTEGER"))
             conn.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS creator_gender TEXT"))
             for t in ("brands", "creators"):
+                conn.execute(text(f"ALTER TABLE {t} ADD COLUMN IF NOT EXISTS source TEXT"))
                 conn.execute(text(f"ALTER TABLE {t} ADD COLUMN IF NOT EXISTS founder_handling BOOLEAN DEFAULT FALSE"))
                 conn.execute(text(f"ALTER TABLE {t} ADD COLUMN IF NOT EXISTS response_date TIMESTAMPTZ"))
                 conn.execute(text(f"ALTER TABLE {t} ADD COLUMN IF NOT EXISTS response_message TEXT"))
@@ -4432,15 +4516,21 @@ def _log_inbound(conn, ctype, cid, msg: InboxMessage, intent, data) -> int:
 def _save_creator_facts(conn, creator_id: str, facts: dict) -> list:
     """Save only the fields that were actually shared. Returns a readable list of what was saved."""
     allowed = ["min_budget", "restrictions", "availability", "best_format", "niche", "location",
-               "audience_type", "languages", "rate_card"]
+               "audience_type", "languages", "rate_card", "reel_rate", "story_rate", "post_rate"]
+    for k in ("min_budget", "reel_rate", "story_rate", "post_rate"):
+        facts[k] = to_int_or_none(facts.get(k))
+    # Their Reel price is their main rate
+    if facts.get("reel_rate") and not facts.get("min_budget"):
+        facts["min_budget"] = facts["reel_rate"]
     upd = {k: facts[k] for k in allowed if facts.get(k) not in (None, "", [])}
     if not upd:
         return []
     set_clause = ", ".join(f"{k} = :{k}" for k in upd)
     conn.execute(text(f"UPDATE creators SET {set_clause} WHERE creator_id = :cid"), {**upd, "cid": creator_id})
     labels = {"min_budget": "rate", "rate_card": "rate card", "best_format": "best format",
-              "audience_type": "audience"}
-    return [f"{labels.get(k, k)}: {format_inr(v) if k == 'min_budget' else v}" for k, v in upd.items()]
+              "audience_type": "audience", "reel_rate": "Reel", "story_rate": "Story", "post_rate": "Post"}
+    money = ("min_budget", "reel_rate", "story_rate", "post_rate")
+    return [f"{labels.get(k, k)}: {format_inr(v) if k in money else v}" for k, v in upd.items()]
 
 
 def _set_log(conn, msg: InboxMessage, intent, data):
@@ -4682,7 +4772,8 @@ async def _plan_pitch_reply(msg, ctx, history, s) -> dict:
             """), {"intent": intent, "summary": parsed.get("summary"), "unsub": unsub, "cid": ctx["contact_id"]})
             if not is_brand:
                 facts = {k: parsed.get(k) for k in ["min_budget", "restrictions", "availability", "best_format",
-                                                    "niche", "location", "audience_type", "languages"]}
+                                                    "niche", "location", "audience_type", "languages",
+                                                    "reel_rate", "story_rate", "post_rate"]}
                 facts["rate_card"] = parsed.get("budget_text")
                 saved = _save_creator_facts(conn, ctx["contact_id"], facts)
 
@@ -4765,6 +4856,8 @@ Return ONLY the JSON object."""))
         _set_log(conn, msg, f"offer_{intent}", parsed)
         saved = _save_creator_facts(conn, o["creator_id"], {
             "rate_card": clean_text(parsed.get("rate_card")),
+            "reel_rate": parsed.get("reel_rate"), "story_rate": parsed.get("story_rate"),
+            "post_rate": parsed.get("post_rate"),
             "restrictions": clean_text(parsed.get("restrictions")),
             "availability": clean_text(parsed.get("availability"))})
         if intent == "unsubscribe":
