@@ -814,6 +814,11 @@ TIMELINE:
   YYYY-MM-DD (use TODAY's date to pick the year; never a date in the past) and set timeline_days to null.
 - If they move an earlier date, use the NEW date.
 
+CREATOR GENDER:
+- creator_gender is "female" or "male" ONLY if the brand explicitly asks for creators of that gender
+  ("female creators only", "we want male fitness creators"). An audience description ("women 20-30")
+  is NOT a creator gender: put that in target_audience and leave creator_gender null.
+
 Format:
 {
   "intent": "interested",
@@ -831,6 +836,7 @@ Format:
   "deliverables": "e.g. 1 Reel + 2 Stories per creator, or null",
   "timeline_days": 21,
   "deadline_date": "2026-11-01 or null",
+  "creator_gender": "female, male or null",
   "requirements": "any other requirements, or null",
   "notes": "anything else important, or null"
 }
@@ -922,6 +928,8 @@ async def steve_parse_reply(request: ParseReplyRequest):
             "deadline": (str(to_date_or_none(parsed.get("deadline_date")))
                          if to_date_or_none(parsed.get("deadline_date")) else None),
             "requirements": clean_text(parsed.get("requirements")),
+            "creator_gender": (str(parsed.get("creator_gender")).strip().lower()
+                               if str(parsed.get("creator_gender") or "").strip().lower() in ("female", "male") else None),
         }
 
         # A campaign is created only when the brand shares real brief details
@@ -1302,7 +1310,7 @@ def offer_exclusivity_days(amount, campaign_exclusivity_days, s: dict) -> int:
 BRIEF_FIELDS = [
     "pricing_model", "total_budget", "rate_per_collab", "slots", "budget_text",
     "platform", "niche", "target_audience", "location_requirement",
-    "deliverables", "requirements", "timeline_days"
+    "deliverables", "requirements", "timeline_days", "creator_gender"
 ]
 
 
@@ -1323,6 +1331,7 @@ class CampaignFromBriefRequest(BaseModel):
     requirements: Optional[str] = None
     timeline_days: Optional[int] = None
     deadline: Optional[str] = None          # a specific go-live date, YYYY-MM-DD
+    creator_gender: Optional[str] = None    # "female" / "male" only when the brand explicitly asked
 
 
 def load_settings() -> dict:
@@ -1558,7 +1567,8 @@ async def fred_match(request: FredMatchRequest):
             creators = [dict(r) for r in conn.execute(text("""
                 SELECT creator_id, creator_name, platform, handle, basic_info, follower_count,
                        engagement_rate, comments, min_budget, restrictions, availability,
-                       best_format, niche, location, audience_type, languages, rate_card
+                       best_format, niche, location, audience_type, languages, rate_card,
+                       gender, COALESCE(response_received, FALSE) AS replied
                 FROM creators
                 WHERE COALESCE(unsubscribed, FALSE) = FALSE
                   AND COALESCE(response_intent, '') NOT IN ('not_interested', 'unsubscribe')
@@ -1606,12 +1616,17 @@ async def fred_match(request: FredMatchRequest):
             cap_stretch = int(total * (1 - margin_floor))   # creator pool at margin floor
 
         # ---------- Step 2: hard filters ----------
-        excluded = {"exclusivity": 0, "platform": 0, "location": 0, "over_budget": 0, "rate_unknown": 0}
+        excluded = {"exclusivity": 0, "platform": 0, "location": 0, "over_budget": 0, "rate_unknown": 0,
+                    "gender": 0}
+        want_gender = str(campaign.get("creator_gender") or "").strip().lower()
         survivors = []
         for c in creators:
             confirmed = c["min_budget"] is not None
+            c_gender = str(c.get("gender") or "").strip().lower()
             if c["creator_id"] in blocked:
                 excluded["exclusivity"] += 1
+            elif want_gender and c_gender and c_gender != want_gender:
+                excluded["gender"] += 1
             elif not _platform_ok(c["platform"], campaign["platform"]):
                 excluded["platform"] += 1
             elif not _location_ok(c["location"], campaign["location_requirement"]):
@@ -1717,6 +1732,13 @@ Score ALL {len(candidates)} candidates. Return ONLY the JSON array."""
             estimated = to_int_or_none(sc.get("estimated_rate"))
             cost = c["min_budget"] if confirmed else estimated
             concerns = sc.get("concerns")
+            flags = []
+            if not c.get("replied"):
+                flags.append("⚠️ Never replied to our first email, rate is a guess")
+            if want_gender and not str(c.get("gender") or "").strip():
+                flags.append(f"⚠️ Gender not recorded (brand asked for {want_gender} creators)")
+            if flags:
+                concerns = " · ".join(flags) + (f". {concerns}" if concerns else "")
 
             # An estimate above the stretch budget rules the creator out, like a confirmed high price
             if not confirmed and estimated is not None and estimated > cap_stretch:
@@ -4291,7 +4313,12 @@ def _ensure_inbox_tables():
                 )
             """))
             conn.execute(text("ALTER TABLE creators ADD COLUMN IF NOT EXISTS rate_card TEXT"))
+            for col in ("founder_draft", "founder_reason", "contact_email", "subject"):
+                conn.execute(text(f"ALTER TABLE pending_actions ADD COLUMN IF NOT EXISTS {col} TEXT"))
+            conn.execute(text("ALTER TABLE creators ADD COLUMN IF NOT EXISTS gender TEXT"))
+            conn.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS creator_gender TEXT"))
             for t in ("brands", "creators"):
+                conn.execute(text(f"ALTER TABLE {t} ADD COLUMN IF NOT EXISTS founder_handling BOOLEAN DEFAULT FALSE"))
                 conn.execute(text(f"ALTER TABLE {t} ADD COLUMN IF NOT EXISTS response_date TIMESTAMPTZ"))
                 conn.execute(text(f"ALTER TABLE {t} ADD COLUMN IF NOT EXISTS response_message TEXT"))
     except Exception as e:
@@ -4437,7 +4464,7 @@ ACTION_LABELS = {
 
 
 def _card(ctx: dict, msg: InboxMessage, summary: str, flag: str, reason, actions: list,
-          draft, saved: list, notes: list) -> str:
+          draft, saved: list, notes: list, founder: Optional[dict] = None) -> str:
     who = "Brand" if ctx["contact_type"] == "brand" else "Creator"
     stage = {"pitch": "reply", "offer": "offer reply", "lineup": "lineup reply"}[ctx["stage"]]
     agent = "Ananya" if ctx["contact_type"] == "brand" else "Aditya"
@@ -4458,6 +4485,11 @@ def _card(ctx: dict, msg: InboxMessage, summary: str, flag: str, reason, actions
         out.append("• Nothing to send. Just noting it")
     if draft:
         out += ["", f"*{agent}'s draft:*", f"```{draft}```"]
+    if founder:
+        out += ["", f"👤 *Founder touch suggested:* {founder['reason']}",
+                "_Pick *I'll reply as Deven* to send this yourself from deven@prabhaav.co "
+                "(the deal steps above still run; the agent's email is not sent)._",
+                "*Your draft as Deven:*", f"```{founder['draft']}```"]
     return "\n".join(out)
 
 
@@ -4483,16 +4515,19 @@ def _lineup_context(c: dict, s: dict) -> str:
             f"If they want to go ahead, ask them to reply confirming the lineup.")
 
 
-def _save_pending(conn, action_id, msg, ctx, summary, draft, plan, campaign_id=None, offer_id=None):
+def _save_pending(conn, action_id, msg, ctx, summary, draft, plan, campaign_id=None, offer_id=None,
+                  founder_draft=None, founder_reason=None):
     conn.execute(text("""
         INSERT INTO pending_actions (action_id, inbox, stage, contact_type, contact_id, contact_name,
-            campaign_id, offer_id, gmail_thread_id, reply_to_message_id, summary, draft, plan)
+            campaign_id, offer_id, gmail_thread_id, reply_to_message_id, summary, draft, plan,
+            founder_draft, founder_reason, contact_email, subject)
         VALUES (:aid, :inbox, :stage, :ct, :cid, :cname, :camp, :oid, :thread, :reply_to, :summary, :draft,
-                CAST(:plan AS JSONB))
+                CAST(:plan AS JSONB), :fdraft, :freason, :cemail, :subject)
     """), {"aid": action_id, "inbox": msg.inbox, "stage": ctx["stage"], "ct": ctx["contact_type"],
            "cid": ctx["contact_id"], "cname": ctx["contact_name"], "camp": campaign_id, "oid": offer_id,
            "thread": msg.gmail_thread_id, "reply_to": msg.gmail_message_id, "summary": summary,
-           "draft": draft, "plan": json.dumps(plan, default=str)})
+           "draft": draft, "plan": json.dumps(plan, default=str), "fdraft": founder_draft,
+           "freason": founder_reason, "cemail": msg.from_email, "subject": msg.subject})
 
 
 def _empty_result(msg: InboxMessage, status="success") -> dict:
@@ -4548,14 +4583,21 @@ async def inbox_handle(msg: InboxMessage):
 
         result.update(plan.pop("immediate", {}))
         if plan.get("needs_approval"):
+            founder = None
+            try:
+                founder = await _founder_touch(msg, ctx, plan, history, s)
+            except Exception as e:
+                print(f"Founder draft failed: {e}")
             action_id = f"ACT_{uuid.uuid4().hex[:12]}"
             with engine.begin() as conn:
                 _save_pending(conn, action_id, msg, ctx, plan["summary"], plan["draft"], plan["actions"],
-                              plan.get("campaign_id"), plan.get("offer_id"))
+                              plan.get("campaign_id"), plan.get("offer_id"),
+                              founder["draft"] if founder else None, founder["reason"] if founder else None)
+            flag = ("👤 " + plan["flag"]) if founder else plan["flag"]
             result.update({"needs_approval": True, "action_id": action_id,
-                           "card_text": _card(ctx, msg, plan["summary"], plan["flag"], plan.get("reason"),
+                           "card_text": _card(ctx, msg, plan["summary"], flag, plan.get("reason"),
                                               plan["actions"], plan["draft"], plan.get("saved", []),
-                                              plan.get("notes", []))})
+                                              plan.get("notes", []), founder)})
         result["slack_note"] = plan.get("slack_note")
         return result
     except HTTPException:
@@ -4927,9 +4969,96 @@ The remaining {100 - pct}% ({balance_line}) is due before the content goes live.
 {ANANYA_SIGNOFF}"""
 
 
+# ---- Founder touch -------------------------------------------------------------
+# Some replies land better coming from the founder: "am I talking to a bot?", complaints,
+# big brand deals, a hesitant brand at the lineup or payment step. For those the card also
+# carries a draft in Deven's voice; Deven sends it himself from deven@prabhaav.co.
+
+DEVEN_SIGNOFF = "Deven\nFounder, Prabhaav\nprabhaav.co"
+
+FOUNDER_PATTERN = re.compile(
+    r"\bbot\b|\bai\b|automated|real person|\bhuman\b|founder|\bowner\b|who runs|in charge|"
+    r"speak to (?:someone|a person|your (?:boss|head))|call me|"
+    r"disappoint|unhappy|not happy|complain|frustrat|unprofessional|refund|scam|fraud|worst|"
+    r"not (?:satisfied|okay with)|delay(?:ed)? again",
+    re.I)
+HESITANT_PATTERN = re.compile(
+    r"not sure|hesitant|think about it|concern|worried|guarantee|trust|advance|payment|invoice|\bgst\b|"
+    r"too (?:much|expensive|high)|why (?:should|do) we pay",
+    re.I)
+
+FOUNDER_PROMPT = PRABHAAV_FACTS.split("- You work for Deven")[0] + """
+You are Deven, the founder of Prabhaav, writing personally to a brand or creator. Your team (Ananya for
+brands, Aditya for creators) has been handling this conversation, and you are stepping in yourself.
+
+""" + SHARED_GUARDRAILS + WRITING_STYLE + """
+HOW DEVEN WRITES
+- First person, warm and direct, like a founder who cares about every client. Short: 80 to 160 words.
+- Open by saying you're the founder and wanted to reply personally (one short line, no flattery).
+- Answer what they actually asked or raised, using ONLY the facts in the team's draft and the context.
+  Keep every number, date and payment detail exactly as in the team's draft. Never add new prices,
+  discounts, promises or guarantees.
+- If they asked whether they're talking to a bot or AI: be honest. Ananya and Aditya are AI assistants
+  that help our team reply quickly; you personally review every deal and every email before it goes out.
+- If they're unhappy: acknowledge it plainly, take responsibility, say what happens next. No excuses.
+- End with one clear next step, and say they can reply to you directly.
+- Sign off exactly:
+""" + DEVEN_SIGNOFF + """
+
+Return ONLY the email body (no subject line, no notes)."""
+
+
+def _founder_reasons(msg: InboxMessage, ctx: dict, plan: dict, s: dict) -> list:
+    reasons = []
+    body = strip_quoted_reply(msg.body or "")
+    with engine.connect() as conn:
+        table, idc = ("brands", "brand_id") if ctx["contact_type"] == "brand" else ("creators", "creator_id")
+        if conn.execute(text(f"SELECT COALESCE(founder_handling, FALSE) FROM {table} WHERE {idc} = :c"),
+                        {"c": ctx["contact_id"]}).scalar():
+            reasons.append("you're already handling this contact")
+        if ctx["contact_type"] == "brand" and plan.get("campaign_id"):
+            c = conn.execute(text("SELECT total_budget, rate_per_collab, slots, final_brand_price FROM campaigns "
+                                  "WHERE campaign_id = :c"), {"c": plan["campaign_id"]}).mappings().first()
+            if c:
+                value = c["final_brand_price"] or c["total_budget"] or ((c["rate_per_collab"] or 0) * (c["slots"] or 1))
+                if value and value >= float(s.get("founder_touch_min_budget", 30000)):
+                    reasons.append(f"big deal ({format_inr(value)})")
+    m = FOUNDER_PATTERN.search(body)
+    if m:
+        reasons.append(f"they wrote “{m.group(0)}”")
+    if ctx["stage"] == "lineup" and HESITANT_PATTERN.search(body) and "Confirmed" not in (plan.get("flag") or ""):
+        reasons.append("brand is unsure at the lineup / payment step")
+    return reasons
+
+
+async def _founder_touch(msg: InboxMessage, ctx: dict, plan: dict, history: str, s: dict) -> Optional[dict]:
+    """If a reply should come from the founder, return {reason, draft} in Deven's voice"""
+    reasons = _founder_reasons(msg, ctx, plan, s)
+    if not reasons:
+        return None
+    who = "brand" if ctx["contact_type"] == "brand" else "creator"
+    draft = await call_claude(FOUNDER_PROMPT, f"""THEY ARE: a {who}, {ctx['contact_name']}
+WHY YOU'RE STEPPING IN: {'; '.join(reasons)}
+
+EARLIER EMAILS:
+{history or '(none)'}
+
+THEIR LATEST EMAIL:
+{strip_quoted_reply(msg.body or '')}
+
+YOUR TEAM'S DRAFT REPLY (the facts to keep):
+{plan.get('draft') or '(no draft: just acknowledge personally and say what happens next)'}
+
+Write your reply now.""")
+    draft = clean_email_text(draft).strip()
+    if not draft.rstrip().endswith("prabhaav.co"):
+        draft = draft.rstrip() + "\n\n" + DEVEN_SIGNOFF
+    return {"reason": "; ".join(reasons), "draft": draft}
+
+
 class InboxApproval(BaseModel):
     action_id: str
-    decision: str                       # the Slack choice: "Approve", "Edit email and approve", "I'll handle it"
+    decision: str                       # "Approve", "Edit email and approve", "I'll reply as Deven", "I'll handle it"
     edited_email: Optional[str] = None
 
 
@@ -4955,12 +5084,17 @@ async def inbox_approve(req: InboxApproval):
             if p["status"] != "pending":
                 return {**out, "status": "skipped", "slack_text": f"ℹ️ Already {p['status']}, nothing done."}
 
-            if "myself" in d or "handle" in d:
+            founder_reply = "deven" in d
+            if founder_reply:
+                table, idc = ("brands", "brand_id") if p["contact_type"] == "brand" else ("creators", "creator_id")
+                conn.execute(text(f"UPDATE {table} SET founder_handling = TRUE WHERE {idc} = :c"),
+                             {"c": p["contact_id"]})
+            elif "myself" in d or "handle" in d:
                 conn.execute(text("UPDATE pending_actions SET status = 'handled_by_deven', decision = :d, "
                                   "decided_at = NOW() WHERE action_id = :a"), {"d": req.decision, "a": req.action_id})
                 return {**out, "slack_text": f"👋 Left for you: {p['contact_name']}. Nothing was sent."}
             # Only a clear Approve / Edit counts. A timed-out card (empty choice) never approves anything.
-            if not (d.startswith("approve") or d.startswith("edit")):
+            if not (founder_reply or d.startswith("approve") or d.startswith("edit")):
                 conn.execute(text("UPDATE pending_actions SET status = 'no_decision', decision = :d, "
                                   "decided_at = NOW() WHERE action_id = :a"), {"d": req.decision, "a": req.action_id})
                 return {**out, "status": "skipped",
@@ -5064,6 +5198,26 @@ async def inbox_approve(req: InboxApproval):
                     else:
                         problems.append("lineup was not open any more")
                         block_email = True
+
+            if founder_reply:
+                # Deven sends this one himself; the agent stays quiet on the thread
+                fdraft = ((req.edited_email or "").strip() or p.get("founder_draft") or p["draft"] or "").strip()
+                if block_email:
+                    problems.append("check the deal state before you reply")
+                conn.execute(text("""
+                    UPDATE pending_actions SET status = 'founder_reply', decision = :d, final_email = :e,
+                           decided_at = NOW() WHERE action_id = :a
+                """), {"d": req.decision, "e": fdraft, "a": req.action_id})
+                agent_email = "ananya@teamprabhaav.com" if p["inbox"] == "ananya" else "aditya@teamprabhaav.com"
+                subj = p.get("subject") or ""
+                subj = subj if subj.lower().startswith("re:") else f"Re: {subj}"
+                out["slack_text"] = (
+                    f"👤 *Over to you, Deven: {p['contact_name']}*" + (f" ({', '.join(done)})" if done else "")
+                    + (("\n⚠️ " + "; ".join(problems)) if problems else "")
+                    + f"\nSend from *deven@prabhaav.co*\nTo: {p.get('contact_email') or '(their email)'}"
+                    + f"\nCC: {agent_email}\nSubject: {subj}\n```{fdraft}```"
+                    + "\nFuture cards for this contact will be marked as yours.")
+                return out
 
             email = (req.edited_email or "").strip() if ("edit" in d and (req.edited_email or "").strip()) else (p["draft"] or "")
             email = email.strip()          # templates and your edits go out exactly as shown on the card
